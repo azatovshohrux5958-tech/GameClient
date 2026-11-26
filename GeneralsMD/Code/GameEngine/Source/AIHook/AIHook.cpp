@@ -44,6 +44,8 @@
 
 #include "gitinfo.h"
 
+#pragma comment(lib, "shell32.lib")	// CommandLineToArgvW
+
 namespace AIHook
 {
 

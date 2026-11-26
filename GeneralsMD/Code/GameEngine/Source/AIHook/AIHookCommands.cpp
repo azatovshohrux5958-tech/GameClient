@@ -61,12 +61,219 @@ namespace AIHook
 
 namespace
 {
+	bool s_selectionDirty = false;
+
+	//---------------------------------------------------------------------------------------------
+	std::string idText(const Json& v)
+	{
+		return v.dump(-1, ' ', false, Json::error_handler_t::replace);
+	}
+
 	Object* findAlive(ObjectID id)
 	{
 		Object* obj = TheGameLogic->findObjectByID(id);
 		if (obj == nullptr || obj->isDestroyed() || obj->isEffectivelyDead())
 			return nullptr;
 		return obj;
+	}
+
+	void requireCanIssueOrders()
+	{
+		Player* me = localPlayer();
+		if (me == nullptr || !me->isPlayerActive())
+			throw CmdError("CANNOT_DO", "the local player is not an active player (observer or defeated)");
+		if (TheRecorder && TheRecorder->isPlaybackMode())
+			throw CmdError("CANNOT_DO", "orders are not possible during replay playback");
+	}
+
+	Coord3D groundPos(double x, double y)
+	{
+		Coord3D pos;
+		pos.x = (Real)x;
+		pos.y = (Real)y;
+		pos.z = TheTerrainLogic->getGroundHeight(pos.x, pos.y);
+		return pos;
+	}
+
+	//---------------------------------------------------------------------------------------------
+	/// Select exactly these objects for the local player (like a UI click), for the next order.
+	void appendSelect(const std::vector<ObjectID>& ids)
+	{
+		GameMessage* sel = TheMessageStream->appendMessage(GameMessage::MSG_CREATE_SELECTED_GROUP_NO_SOUND);
+		sel->appendBooleanArgument(TRUE);	// new group
+		for (size_t i = 0; i < ids.size(); ++i)
+			sel->appendObjectIDArgument(ids[i]);
+		s_selectionDirty = true;
+	}
+
+	void appendSelect(ObjectID id)
+	{
+		std::vector<ObjectID> ids(1, id);
+		appendSelect(ids);
+	}
+
+	//---------------------------------------------------------------------------------------------
+	struct UnitList
+	{
+		std::vector<ObjectID> ok;
+		Json rejected;
+	};
+
+	UnitList collectUnits(const Json& args)
+	{
+		if (!args.contains("unit_ids") || !args["unit_ids"].is_array() || args["unit_ids"].empty())
+			throw CmdError("BAD_ARGS", "unit_ids must be a non-empty list of object ids");
+
+		UnitList out;
+		out.rejected = Json::array();
+		Player* me = localPlayer();
+		const Json& ids = args["unit_ids"];
+		for (size_t i = 0; i < ids.size(); ++i)
+		{
+			const Json& v = ids[i];
+			const char* code = nullptr;
+			ObjectID id = INVALID_ID;
+			if (!v.is_number_integer() || v.get<long long>() <= 0)
+				code = "BAD_ARGS";
+			else
+			{
+				id = (ObjectID)v.get<long long>();
+				Object* obj = findAlive(id);
+				if (obj == nullptr)
+					code = "UNIT_DEAD";
+				else if (obj->getControllingPlayer() != me)
+					code = "NOT_OWNED";
+				else if (obj->isKindOf(KINDOF_STRUCTURE) || obj->getAIUpdateInterface() == nullptr ||
+						obj->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION))
+					code = "CANNOT_DO";
+			}
+			if (code)
+			{
+				Json r;
+				r["id"] = v;
+				r["code"] = code;
+				out.rejected.push_back(r);
+			}
+			else if (std::find(out.ok.begin(), out.ok.end(), id) == out.ok.end())
+				out.ok.push_back(id);
+		}
+		if (out.ok.empty())
+			throw CmdError(out.rejected[0]["code"].get<std::string>().c_str(),
+				strf("no valid units in %s", idText(ids).c_str()));
+		return out;
+	}
+
+	Json orderResult(const UnitList& units)
+	{
+		Json res;
+		res["queued"] = true;
+		res["unit_ids"] = units.ok;
+		if (!units.rejected.empty())
+			res["rejected"] = units.rejected;
+		return res;
+	}
+
+	Json orderResult(ObjectID id)
+	{
+		Json res;
+		res["queued"] = true;
+		Json ids = Json::array();
+		ids.push_back(id);
+		res["unit_ids"] = ids;
+		return res;
+	}
+
+	//---------------------------------------------------------------------------------------------
+	const CommandSet* commandSetOf(const Object* obj)
+	{
+		if (TheControlBar == nullptr)
+			return nullptr;
+		return TheControlBar->findCommandSet(obj->getCommandSetString());
+	}
+
+	/// The build button for 'tt' in the producer's command set, as BuildAssistant::isPossibleToMakeUnit finds it.
+	const CommandButton* findBuildButton(const Object* producer, const ThingTemplate* tt)
+	{
+		const CommandSet* cs = commandSetOf(producer);
+		if (cs == nullptr)
+			return nullptr;
+		for (Int i = 0; i < MAX_COMMANDS_PER_SET; ++i)
+		{
+			const CommandButton* b = cs->getCommandButton(i);
+			if (b && (b->getCommandType() == GUI_COMMAND_UNIT_BUILD || b->getCommandType() == GUI_COMMAND_DOZER_CONSTRUCT) &&
+					b->getThingTemplate() && b->getThingTemplate()->isEquivalentTo(tt))
+				return b;
+		}
+		return nullptr;
+	}
+
+	const CommandButton* findUpgradeButton(const Object* producer, const UpgradeTemplate* ut)
+	{
+		const CommandSet* cs = commandSetOf(producer);
+		if (cs == nullptr)
+			return nullptr;
+		for (Int i = 0; i < MAX_COMMANDS_PER_SET; ++i)
+		{
+			const CommandButton* b = cs->getCommandButton(i);
+			if (b && (b->getCommandType() == GUI_COMMAND_PLAYER_UPGRADE || b->getCommandType() == GUI_COMMAND_OBJECT_UPGRADE) &&
+					b->getUpgradeTemplate() == ut)
+				return b;
+		}
+		return nullptr;
+	}
+
+	const ThingTemplate* findThing(const std::string& name)
+	{
+		if (name.empty())
+			return nullptr;
+		return TheThingFactory->findTemplate(AsciiString(name.c_str()), FALSE);
+	}
+
+	const UpgradeTemplate* findUpgradeByName(const std::string& name)
+	{
+		for (const UpgradeTemplate* ut = TheUpgradeCenter->firstUpgradeTemplate(); ut; ut = ut->friend_getNext())
+			if (name == ut->getUpgradeName().str())
+				return ut;
+		return nullptr;
+	}
+
+	const SpecialPowerTemplate* findPowerByName(const std::string& name)
+	{
+		Int n = TheSpecialPowerStore->getNumSpecialPowers();
+		for (Int i = 0; i < n; ++i)
+		{
+			const SpecialPowerTemplate* sp = TheSpecialPowerStore->getSpecialPowerTemplateByIndex((UnsignedInt)i);
+			if (sp && name == sp->getName().str())
+				return sp;
+		}
+		return nullptr;
+	}
+
+	ScienceType findScienceByName(const std::string& name)
+	{
+		std::vector<AsciiString> names = TheScienceStore->friend_getScienceNames();
+		for (size_t i = 0; i < names.size(); ++i)
+			if (name == names[i].str())
+				return TheScienceStore->getScienceFromInternalName(names[i]);	// key already exists
+		return SCIENCE_INVALID;
+	}
+
+	std::string joinNames(const std::vector<std::string>& v)
+	{
+		std::string s;
+		for (size_t i = 0; i < v.size(); ++i)
+		{
+			if (i)
+				s += ", ";
+			s += v[i];
+		}
+		return s;
+	}
+
+	[[noreturn]] void throwMissingPrereq(const ThingTemplate* tt, Player* me)
+	{
+		std::vector<std::string> miss = missingPrereqNames(tt, me);
+		throw CmdError("MISSING_PREREQ", miss.empty() ? std::string("prerequisites not met") : "needs " + joinNames(miss));
 	}
 
 	//---------------------------------------------------------------------------------------------
@@ -110,6 +317,10 @@ namespace
 	{
 		{ "ping", cmdPing },
 		{ "get_status", cmdGetStatus },
+		{ "get_state", cmdGetState },
+		{ "get_map", cmdGetMap },
+		{ "query_path", cmdQueryPath },
+		{ "get_unit_data", cmdGetUnitData },
 	};
 
 	CommandFn findCommand(const std::string& cmd)
@@ -205,6 +416,34 @@ Json runCommand(const std::string& cmd, const Json& args)
 
 void commandsEndOfBatch()
 {
+	if (!s_selectionDirty)
+		return;
+	s_selectionDirty = false;
+	if (!inMatch() || TheInGameUI == nullptr)
+		return;
+
+	// put the human's selection back (logic-side selection is per player and orders replaced it)
+	std::vector<ObjectID> ids;
+	const DrawableList* sel = TheInGameUI->getAllSelectedDrawables();
+	if (sel)
+	{
+		for (DrawableList::const_iterator it = sel->begin(); it != sel->end(); ++it)
+		{
+			const Drawable* d = *it;
+			const Object* obj = d ? d->getObject() : nullptr;
+			if (obj && obj->isLocallyControlled())
+				ids.push_back(obj->getID());
+		}
+	}
+	if (ids.empty())
+		TheMessageStream->appendMessage(GameMessage::MSG_DESTROY_SELECTED_GROUP);
+	else
+	{
+		GameMessage* m = TheMessageStream->appendMessage(GameMessage::MSG_CREATE_SELECTED_GROUP_NO_SOUND);
+		m->appendBooleanArgument(TRUE);
+		for (size_t i = 0; i < ids.size(); ++i)
+			m->appendObjectIDArgument(ids[i]);
+	}
 }
 
 }	// namespace AIHook
