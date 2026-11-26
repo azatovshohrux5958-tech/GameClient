@@ -399,6 +399,8 @@ public:
 	Real getUnmodifiedAttackRange() const;
 	Real getMinimumAttackRange() const;
 	Int getDelayBetweenShots(const WeaponBonus& bonus) const;
+	Int friend_getMinDelayBetweenShots() const { return m_minDelayBetweenShots; }	///< zh-mcp AIHook: no RNG (frames)
+	Int friend_getMaxDelayBetweenShots() const { return m_maxDelayBetweenShots; }	///< zh-mcp AIHook: no RNG (frames)
 	Int getClipReloadTime(const WeaponBonus& bonus) const;
 	Real getPrimaryDamage(const WeaponBonus& bonus) const;
 	Real getPrimaryDamageRadius(const WeaponBonus& bonus) const;

@@ -136,6 +136,7 @@ public:
 	const FieldParse* getFieldParse() const;
 
 	void friend_setName(const AsciiString& n) { m_name = n; }
+	Real friend_getMaxSpeed() const { return m_maxSpeed; }	///< zh-mcp AIHook: read-only (dist/frame)
 
 	void validate();
 

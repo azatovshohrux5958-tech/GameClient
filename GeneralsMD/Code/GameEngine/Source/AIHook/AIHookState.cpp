@@ -74,6 +74,41 @@ namespace AIHook
 
 namespace
 {
+	//---------------------------------------------------------------------------------------------
+	// Static map knowledge, captured when the match starts (what a human knows from the preview)
+	//---------------------------------------------------------------------------------------------
+	struct Feature
+	{
+		unsigned id;
+		std::string type;
+		double x, y;
+	};
+
+	bool s_haveStatic = false;
+	Region3D s_extent;
+	int s_cellsW = 0, s_cellsH = 0;
+	std::string s_cells;						///< one char per pathfind cell, row-major from lo.y
+	std::vector<Feature> s_features;
+	Json s_startPositions;
+
+	// get_unit_data caches (template data is static for a match)
+	bool s_haveBuiltBy = false;
+	std::map<std::string, std::vector<std::string> > s_builtBy;
+
+	char cellChar(PathfindCell* c)
+	{
+		if (c == nullptr)
+			return '#';
+		switch (c->getType())
+		{
+			case PathfindCell::CELL_CLEAR:
+			case PathfindCell::CELL_RUBBLE: return '.';
+			case PathfindCell::CELL_WATER: return '~';
+			case PathfindCell::CELL_CLIFF: return 'c';
+			default: return '#';	// obstacles (map-placed structures at match start) and impassable
+		}
+	}
+
 	const char* templateKind(const ThingTemplate* tt)
 	{
 		if (tt->isKindOf(KINDOF_SUPPLY_SOURCE) && !tt->isKindOf(KINDOF_CASH_GENERATOR))
@@ -257,6 +292,265 @@ namespace
 		return d;
 	}
 
+	//---------------------------------------------------------------------------------------------
+	// get_unit_data pieces
+	//---------------------------------------------------------------------------------------------
+	void buildBuiltByCache()
+	{
+		if (s_haveBuiltBy)
+			return;
+		s_haveBuiltBy = true;
+		s_builtBy.clear();
+		if (TheControlBar == nullptr)
+			return;
+		for (const ThingTemplate* t = TheThingFactory->firstTemplate(); t; t = t->friend_getNextTemplate())
+		{
+			const AsciiString& csName = t->friend_getCommandSetString();
+			if (csName.isEmpty())
+				continue;
+			const CommandSet* cs = TheControlBar->findCommandSet(csName);
+			if (cs == nullptr)
+				continue;
+			for (Int i = 0; i < MAX_COMMANDS_PER_SET; ++i)
+			{
+				const CommandButton* b = cs->getCommandButton(i);
+				if (b == nullptr || (b->getCommandType() != GUI_COMMAND_UNIT_BUILD && b->getCommandType() != GUI_COMMAND_DOZER_CONSTRUCT))
+					continue;
+				if (!b->getThingTemplate())
+					continue;
+				std::vector<std::string>& v = s_builtBy[b->getThingTemplate()->getName().str()];
+				std::string builder = t->getName().str();
+				if (std::find(v.begin(), v.end(), builder) == v.end())
+					v.push_back(builder);
+			}
+		}
+	}
+
+	std::set<std::string> playableSides()
+	{
+		std::set<std::string> sides;
+		if (ThePlayerTemplateStore == nullptr)
+			return sides;
+		for (Int i = 0; i < ThePlayerTemplateStore->getPlayerTemplateCount(); ++i)
+		{
+			const PlayerTemplate* pt = ThePlayerTemplateStore->getNthPlayerTemplate(i);
+			if (pt && pt->isPlayableSide())
+				sides.insert(pt->getSide().str());
+		}
+		return sides;
+	}
+
+	double templateMaxHealth(const ThingTemplate* tt)
+	{
+		const ModuleInfo& mi = tt->getBehaviorModuleInfo();
+		for (size_t i = 0; i < (size_t)mi.getCount(); ++i)
+		{
+			const ActiveBodyModuleData* body = dynamic_cast<const ActiveBodyModuleData*>(mi.getNthData(i));
+			if (body)
+				return body->m_maxHealth;
+		}
+		return 0.0;
+	}
+
+	double templateSpeed(const ThingTemplate* tt)
+	{
+		const AIUpdateModuleData* ai = const_cast<ThingTemplate*>(tt)->friend_getAIModuleInfo();
+		if (ai == nullptr)
+			return 0.0;
+		const LocomotorTemplateVector* v = ai->findLocomotorTemplateVector(LOCOMOTORSET_NORMAL);
+		if (v == nullptr)
+			return 0.0;
+		for (size_t i = 0; i < v->size(); ++i)
+			if ((*v)[i])
+				return r1((*v)[i]->friend_getMaxSpeed() * logicFps());	// dist/frame -> dist/s
+		return 0.0;
+	}
+
+	Json antiList(Int mask)
+	{
+		Json a = Json::array();
+		if (mask & WEAPON_ANTI_GROUND)
+			a.push_back("ground");
+		if (mask & (WEAPON_ANTI_AIRBORNE_VEHICLE | WEAPON_ANTI_AIRBORNE_INFANTRY))
+			a.push_back("air");
+		if (mask & (WEAPON_ANTI_PROJECTILE | WEAPON_ANTI_SMALL_MISSILE | WEAPON_ANTI_BALLISTIC_MISSILE))
+			a.push_back("missile");
+		if (mask & WEAPON_ANTI_MINE)
+			a.push_back("mine");
+		return a;
+	}
+
+	Json templateWeapons(const ThingTemplate* tt)
+	{
+		Json out = Json::array();
+		const WeaponTemplateSetVector& sets = tt->getWeaponTemplateSets();
+		if (sets.empty())
+			return out;
+		const WeaponTemplateSet& ws = sets[0];	// default set (no conditions)
+		WeaponBonus bonus;
+		for (Int slot = PRIMARY_WEAPON; slot < WEAPONSLOT_COUNT; ++slot)
+		{
+			const WeaponTemplate* wt = ws.getNth((WeaponSlotType)slot);
+			if (wt == nullptr)
+				continue;
+			Json w;
+			w["name"] = wt->getName().str();
+			w["damage"] = r1(wt->getPrimaryDamage(bonus));
+			w["range"] = r1(wt->getUnmodifiedAttackRange());
+			double delayFrames = 0.5 * (wt->friend_getMinDelayBetweenShots() + wt->friend_getMaxDelayBetweenShots());
+			w["reload_s"] = floor(delayFrames / logicFps() * 100.0 + 0.5) / 100.0;
+			if (wt->getClipSize() > 0)
+			{
+				w["clip_size"] = wt->getClipSize();
+				w["clip_reload_s"] = floor(wt->getClipReloadTime(bonus) / logicFps() * 100.0 + 0.5) / 100.0;
+			}
+			const char* dt = DamageTypeFlags::getNameFromSingleBit((Int)wt->getDamageType());
+			w["damage_type"] = dt ? dt : "";
+			w["radius"] = r1(wt->getPrimaryDamageRadius(bonus));
+			w["anti"] = antiList(wt->getAntiMask());
+			w["slot"] = slot == PRIMARY_WEAPON ? "primary" : (slot == SECONDARY_WEAPON ? "secondary" : "tertiary");
+			out.push_back(w);
+		}
+		return out;
+	}
+
+	/// The armor's damage multipliers that differ from 100% (the ArmorTemplate keeps no name).
+	Json templateArmorCoefficients(const ThingTemplate* tt)
+	{
+		Json out = Json::object();
+		const ArmorTemplateSet* as = tt->findArmorTemplateSet(ArmorSetFlags());
+		const ArmorTemplate* at = as ? as->getArmorTemplate() : nullptr;
+		if (at == nullptr)
+			return out;
+		for (Int i = 0; i < DAMAGE_NUM_TYPES; ++i)
+		{
+			Real v = at->adjustDamage((DamageType)i, 100.0f);
+			if (v < 99.95f || v > 100.05f)
+			{
+				const char* n = DamageTypeFlags::getNameFromSingleBit(i);
+				if (n)
+					out[n] = r1(v);
+			}
+		}
+		return out;
+	}
+
+	Json templateInfo(const ThingTemplate* tt, Player* me)
+	{
+		Json d;
+		d["side"] = tt->getDefaultOwningSide().str();
+		d["kind"] = templateKind(tt);
+		d["cost"] = tt->calcCostToBuild(me);
+		d["build_time_s"] = floor(tt->calcTimeToBuild(me) / logicFps() * 10.0 + 0.5) / 10.0;
+		d["max_health"] = r1(templateMaxHealth(tt));
+		d["speed"] = templateSpeed(tt);
+		d["vision"] = r1(tt->friend_calcVisionRange());
+		d["weapons"] = templateWeapons(tt);
+		d["armor"] = "";
+		d["armor_coefficients"] = templateArmorCoefficients(tt);
+		d["prereqs"] = unitPrereqNames(tt);
+		std::map<std::string, std::vector<std::string> >::const_iterator it = s_builtBy.find(tt->getName().str());
+		d["built_by"] = it != s_builtBy.end() ? it->second : std::vector<std::string>();
+		Json kinds = Json::array();
+		for (Int k = KINDOF_FIRST; k < KINDOF_COUNT; ++k)
+		{
+			if (tt->isKindOf((KindOfType)k))
+			{
+				const char* n = KindOfMaskType::getNameFromSingleBit(k);
+				if (n)
+					kinds.push_back(n);
+			}
+		}
+		d["kind_of"] = kinds;
+		Int power = tt->getEnergyProduction();
+		if (power != 0)
+			d["power"] = power;
+		return d;
+	}
+
+	//---------------------------------------------------------------------------------------------
+	// query_path: A* on the ground pathfind layer, using only read accessors
+	//---------------------------------------------------------------------------------------------
+	double gridPathLength(Pathfinder* pf, LocomotorSurfaceTypeMask surfaces, const Coord3D& from, const Coord3D& to, bool& ok)
+	{
+		ok = false;
+		ICoord2D s, g;
+		pf->worldToCell(&from, &s);
+		pf->worldToCell(&to, &g);
+		const ICoord2D* hi = pf->getExtent();
+		const int W = hi->x + 1, H = hi->y + 1;
+		if (W <= 0 || H <= 0 || s.x < 0 || s.y < 0 || g.x < 0 || g.y < 0 || s.x >= W || s.y >= H || g.x >= W || g.y >= H)
+			return 0.0;
+		const int start = s.y * W + s.x, goal = g.y * W + g.x;
+		if (start == goal)
+		{
+			ok = true;
+			return 0.0;
+		}
+
+		std::vector<signed char> pass((size_t)W * H, -1);	// -1 unknown, 0 blocked, 1 open
+		auto passable = [&](int idx) -> bool
+		{
+			signed char& p = pass[(size_t)idx];
+			if (p < 0)
+			{
+				PathfindCell* c = pf->getCell(LAYER_GROUND, idx % W, idx / W);
+				p = (c && pf->validMovementPosition(FALSE, surfaces, c)) ? 1 : 0;
+			}
+			return p == 1;
+		};
+		pass[(size_t)start] = 1;	// we're standing here, whatever the cell says
+
+		std::vector<float> gcost((size_t)W * H, 1e30f);
+		typedef std::pair<float, int> Node;
+		std::priority_queue<Node, std::vector<Node>, std::greater<Node> > open;
+		auto h = [&](int idx) -> float
+		{
+			int dx = abs(idx % W - g.x), dy = abs(idx / W - g.y);
+			int mn = dx < dy ? dx : dy, mx = dx < dy ? dy : dx;
+			return (float)(mx - mn) + 1.41421356f * (float)mn;
+		};
+		gcost[(size_t)start] = 0.0f;
+		open.push(Node(h(start), start));
+		const int dxs[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
+		const int dys[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
+		int expansions = 0;
+		while (!open.empty())
+		{
+			Node n = open.top();
+			open.pop();
+			int cur = n.second;
+			float gc = gcost[(size_t)cur];
+			if (n.first > gc + h(cur) + 1e-3f)
+				continue;	// stale entry
+			if (cur == goal)
+			{
+				ok = true;
+				return gc * PATHFIND_CELL_SIZE_F;
+			}
+			if (++expansions > 1500000)
+				break;
+			int cx = cur % W, cy = cur / W;
+			for (int k = 0; k < 8; ++k)
+			{
+				int nx = cx + dxs[k], ny = cy + dys[k];
+				if (nx < 0 || ny < 0 || nx >= W || ny >= H)
+					continue;
+				int ni = ny * W + nx;
+				if (!passable(ni))
+					continue;
+				if (k >= 4 && (!passable(cy * W + nx) || !passable(ny * W + cx)))
+					continue;	// no corner cutting
+				float ng = gc + (k >= 4 ? 1.41421356f : 1.0f);
+				if (ng < gcost[(size_t)ni])
+				{
+					gcost[(size_t)ni] = ng;
+					open.push(Node(ng + h(ni), ni));
+				}
+			}
+		}
+		return 0.0;
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -450,11 +744,225 @@ Json cmdGetState(const Json& args)
 }
 
 //-------------------------------------------------------------------------------------------------
-void stateOnMatchStart() {}
-void stateOnMatchEnd() {}
+void stateOnMatchStart()
+{
+	s_haveStatic = false;
+	s_haveBuiltBy = false;
+	s_builtBy.clear();
+	s_features.clear();
+	s_cells.clear();
+	s_startPositions = Json::array();
 
-Json cmdGetMap(const Json&) { throw CmdError("CANNOT_DO", "not implemented yet"); }
-Json cmdQueryPath(const Json&) { throw CmdError("CANNOT_DO", "not implemented yet"); }
-Json cmdGetUnitData(const Json&) { throw CmdError("CANNOT_DO", "not implemented yet"); }
+	if (TheTerrainLogic == nullptr || TheAI == nullptr || TheAI->pathfinder() == nullptr)
+		return;
+	TheTerrainLogic->getExtent(&s_extent);
+
+	// terrain classes at match start (only map-placed structures and the starting buildings exist)
+	Pathfinder* pf = TheAI->pathfinder();
+	s_cellsW = (int)((s_extent.hi.x - s_extent.lo.x) / PATHFIND_CELL_SIZE_F);
+	s_cellsH = (int)((s_extent.hi.y - s_extent.lo.y) / PATHFIND_CELL_SIZE_F);
+	if (s_cellsW < 0) s_cellsW = 0;
+	if (s_cellsH < 0) s_cellsH = 0;
+	s_cells.resize((size_t)s_cellsW * s_cellsH);
+	for (int j = 0; j < s_cellsH; ++j)
+	{
+		for (int i = 0; i < s_cellsW; ++i)
+		{
+			Coord3D pos;
+			pos.x = s_extent.lo.x + (i + 0.5f) * PATHFIND_CELL_SIZE_F;
+			pos.y = s_extent.lo.y + (j + 0.5f) * PATHFIND_CELL_SIZE_F;
+			pos.z = 0.0f;
+			s_cells[(size_t)j * s_cellsW + i] = cellChar(pf->getCell(LAYER_GROUND, &pos));
+		}
+	}
+
+	// start spots
+	for (Int n = 1; n <= MAX_PLAYER_COUNT; ++n)
+	{
+		AsciiString wpName;
+		wpName.format("Player_%d_Start", n);
+		Waypoint* wp = TheTerrainLogic->getWaypointByName(wpName);
+		if (wp == nullptr)
+			continue;
+		Json sp;
+		sp["index"] = n - 1;
+		sp["x"] = r1(wp->getLocation()->x);
+		sp["y"] = r1(wp->getLocation()->y);
+		s_startPositions.push_back(sp);
+	}
+
+	// map-placed neutral economy/tech objects
+	Player* neutralPlayer = ThePlayerList->getNeutralPlayer();
+	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject())
+	{
+		const Player* owner = obj->getControllingPlayer();
+		if (owner != nullptr && owner != neutralPlayer)
+			continue;
+		const ThingTemplate* tt = obj->getTemplate();
+		if (!(tt->isKindOf(KINDOF_SUPPLY_SOURCE) || tt->isKindOf(KINDOF_TECH_BUILDING) || tt->isKindOf(KINDOF_CASH_GENERATOR) ||
+				(tt->isKindOf(KINDOF_STRUCTURE) && tt->isKindOf(KINDOF_CAPTURABLE))))
+			continue;
+		if (!isReportable(obj))
+			continue;
+		Feature f;
+		f.id = (unsigned)obj->getID();
+		f.type = tt->getName().str();
+		f.x = r1(obj->getPosition()->x);
+		f.y = r1(obj->getPosition()->y);
+		s_features.push_back(f);
+	}
+	s_haveStatic = true;
+}
+
+void stateOnMatchEnd()
+{
+	s_haveStatic = false;
+	s_haveBuiltBy = false;
+	s_builtBy.clear();
+	s_features.clear();
+	s_cells.clear();
+}
+
+//-------------------------------------------------------------------------------------------------
+Json cmdGetMap(const Json& args)
+{
+	long long stride = argIntOr(args, "cell_stride", 4);
+	if (stride < 1)
+		stride = 1;
+	if (stride > 32)
+		stride = 32;
+	if (!s_haveStatic)
+		stateOnMatchStart();
+
+	const int gw = s_cellsW / (int)stride, gh = s_cellsH / (int)stride;
+	std::string passable;
+	passable.reserve((size_t)gw * gh);
+	for (int j = 0; j < gh; ++j)
+	{
+		for (int i = 0; i < gw; ++i)
+		{
+			int ci = i * (int)stride + (int)stride / 2, cj = j * (int)stride + (int)stride / 2;
+			passable.push_back(s_cells[(size_t)cj * s_cellsW + ci]);
+		}
+	}
+
+	Json m;
+	m["name"] = mapName();
+	m["width"] = r1(s_extent.hi.x - s_extent.lo.x);
+	m["height"] = r1(s_extent.hi.y - s_extent.lo.y);
+	m["origin"] = { { "x", r1(s_extent.lo.x) }, { "y", r1(s_extent.lo.y) } };
+	m["cell_size"] = (double)PATHFIND_CELL_SIZE_F;
+	m["cell_stride"] = stride;
+	m["grid_w"] = gw;
+	m["grid_h"] = gh;
+	m["passable"] = passable;
+	m["start_positions"] = s_startPositions;
+	Json feats = Json::array();
+	for (size_t i = 0; i < s_features.size(); ++i)
+	{
+		Json f;
+		f["type"] = s_features[i].type;
+		f["x"] = s_features[i].x;
+		f["y"] = s_features[i].y;
+		f["id"] = s_features[i].id;
+		feats.push_back(f);
+	}
+	m["features"] = feats;
+	return m;
+}
+
+//-------------------------------------------------------------------------------------------------
+Json cmdQueryPath(const Json& args)
+{
+	if (!hasArg(args, "unit_id"))
+		throw CmdError("BAD_ARGS", "unit_id is required");
+	Object* unit = requireOwnObject(args["unit_id"], "unit");
+	double x = argReal(args, "x"), y = argReal(args, "y");
+	requireOnMap(x, y);
+
+	Json r;
+	AIUpdateInterface* ai = unit->getAIUpdateInterface();
+	if (ai == nullptr || unit->isKindOf(KINDOF_STRUCTURE))
+	{
+		r["reachable"] = false;
+		r["distance"] = 0.0;
+		return r;
+	}
+
+	Coord3D to;
+	to.x = (Real)x;
+	to.y = (Real)y;
+	to.z = TheTerrainLogic->getGroundHeight(to.x, to.y);
+	const Coord3D* from = unit->getPosition();
+	const LocomotorSet& ls = ai->getLocomotorSet();
+	const double straight = sqrt((to.x - from->x) * (to.x - from->x) + (to.y - from->y) * (to.y - from->y));
+
+	if (ls.getValidSurfaces() & LOCOMOTORSURFACE_AIR)
+	{
+		r["reachable"] = true;
+		r["distance"] = r1(straight);
+		return r;
+	}
+
+	Pathfinder* pf = TheAI->pathfinder();
+	Bool reachable = pf->clientSafeQuickDoesPathExist(ls, from, &to);
+	r["reachable"] = (bool)reachable;
+	if (!reachable)
+	{
+		r["distance"] = 0.0;
+		return r;
+	}
+	bool ok = false;
+	double d = gridPathLength(pf, ls.getValidSurfaces(), *from, to, ok);
+	if (ok)
+		r["distance"] = r1(d);
+	else
+	{
+		// reachable per the game, but not on the ground layer alone (bridges): straight-line estimate
+		r["distance"] = r1(straight);
+		r["approx"] = true;
+	}
+	return r;
+}
+
+//-------------------------------------------------------------------------------------------------
+Json cmdGetUnitData(const Json& args)
+{
+	buildBuiltByCache();
+	Player* me = localPlayer();
+	Json out = Json::object();
+
+	if (hasArg(args, "templates"))
+	{
+		if (!args["templates"].is_array())
+			throw CmdError("BAD_ARGS", "templates must be a list of strings");
+		const Json& names = args["templates"];
+		for (size_t i = 0; i < names.size(); ++i)
+		{
+			if (!names[i].is_string())
+				throw CmdError("BAD_ARGS", "templates must be a list of strings");
+			std::string n = names[i].get<std::string>();
+			const ThingTemplate* tt = n.empty() ? nullptr : TheThingFactory->findTemplate(AsciiString(n.c_str()), FALSE);
+			if (tt == nullptr)
+				throw CmdError("INVALID_TEMPLATE", strf("unknown template '%s'", n.c_str()));
+			out[n] = templateInfo(tt, me);
+		}
+	}
+	else
+	{
+		// default: every template some playable side can build
+		std::set<std::string> sides = playableSides();
+		for (std::map<std::string, std::vector<std::string> >::const_iterator it = s_builtBy.begin(); it != s_builtBy.end(); ++it)
+		{
+			const ThingTemplate* tt = TheThingFactory->findTemplate(AsciiString(it->first.c_str()), FALSE);
+			if (tt == nullptr || sides.find(tt->getDefaultOwningSide().str()) == sides.end())
+				continue;
+			out[it->first] = templateInfo(tt, me);
+		}
+	}
+	Json r;
+	r["templates"] = out;
+	return r;
+}
 
 }	// namespace AIHook
