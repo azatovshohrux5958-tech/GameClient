@@ -117,6 +117,7 @@
 #include "GameNetwork/GameSpyOverlay.h"
 #include <chrono>
 #include "WW3D2/ww3d.h"
+#include "AIHook/AIHook.h" // zh-mcp
 
 static bool g_bTearDownGeneralsOnlineRequested = false;
 void TearDownGeneralsOnline()
@@ -996,6 +997,7 @@ void GameEngine::update()
 
 			TheAudio->UPDATE();
 			TheGameClient->UPDATE();
+			AIHook::update(); // zh-mcp: no-op without -aihook; appends orders before propagation
 			TheMessageStream->propagateMessages();
 
             if (TheNetwork != nullptr)

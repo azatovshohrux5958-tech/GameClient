@@ -1,4 +1,12 @@
 set(GAMEENGINE_SRC
+    # zh-mcp AI hook (see Include/AIHook/AIHook.h)
+    Include/AIHook/AIHook.h
+    Include/AIHook/AIHookInternal.h
+    Source/AIHook/AIHook.cpp
+    Source/AIHook/AIHookCommands.cpp
+    Source/AIHook/AIHookEvents.cpp
+    Source/AIHook/AIHookServer.cpp
+    Source/AIHook/AIHookState.cpp
 #    Include/Common/AcademyStats.h
     Include/Common/ActionManager.h
 #    Include/Common/ArchiveFile.h
