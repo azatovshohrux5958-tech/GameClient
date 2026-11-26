@@ -306,6 +306,55 @@ namespace
 	}
 
 	//---------------------------------------------------------------------------------------------
+	// Core orders (B3)
+	//---------------------------------------------------------------------------------------------
+	Json groupOrderAtPos(const Json& args, GameMessage::Type type, Bool withGuardMode)
+	{
+		requireCanIssueOrders();
+		UnitList units = collectUnits(args);
+		double x = argReal(args, "x"), y = argReal(args, "y");
+		requireOnMap(x, y);
+		appendSelect(units.ok);
+		GameMessage* msg = TheMessageStream->appendMessage(type);
+		msg->appendLocationArgument(groundPos(x, y));
+		if (withGuardMode)
+			msg->appendIntegerArgument(GUARDMODE_NORMAL);
+		return orderResult(units);
+	}
+
+	Json cmdMove(const Json& a) { return groupOrderAtPos(a, GameMessage::MSG_DO_MOVETO, FALSE); }
+	Json cmdAttackMove(const Json& a) { return groupOrderAtPos(a, GameMessage::MSG_DO_ATTACKMOVETO, FALSE); }
+	Json cmdForceAttackGround(const Json& a) { return groupOrderAtPos(a, GameMessage::MSG_DO_FORCE_ATTACK_GROUND, FALSE); }
+	Json cmdGuard(const Json& a) { return groupOrderAtPos(a, GameMessage::MSG_DO_GUARD_POSITION, TRUE); }
+
+	Json cmdStop(const Json& args)
+	{
+		requireCanIssueOrders();
+		UnitList units = collectUnits(args);
+		appendSelect(units.ok);
+		TheMessageStream->appendMessage(GameMessage::MSG_DO_STOP);
+		return orderResult(units);
+	}
+
+	Json cmdAttack(const Json& args)
+	{
+		requireCanIssueOrders();
+		UnitList units = collectUnits(args);
+		if (!hasArg(args, "target_id"))
+			throw CmdError("BAD_ARGS", "target_id is required");
+		ObjectID tid = (ObjectID)argObjectID(args["target_id"], "target_id");
+		Object* target = findAlive(tid);
+		if (target == nullptr || !isVisibleToLocal(target))
+			throw CmdError("UNIT_DEAD", strf("target %u does not exist or is not visible", (unsigned)tid));
+		appendSelect(units.ok);
+		// non-enemies (own, allied, civilian) can only be attacked with a force-attack, as in the UI
+		GameMessage::Type type = isEnemyOfLocal(target) ? GameMessage::MSG_DO_ATTACK_OBJECT : GameMessage::MSG_DO_FORCE_ATTACK_OBJECT;
+		GameMessage* msg = TheMessageStream->appendMessage(type);
+		msg->appendObjectIDArgument(tid);
+		return orderResult(units);
+	}
+
+	//---------------------------------------------------------------------------------------------
 	typedef Json (*CommandFn)(const Json&);
 	struct CommandEntry
 	{
@@ -321,6 +370,12 @@ namespace
 		{ "get_map", cmdGetMap },
 		{ "query_path", cmdQueryPath },
 		{ "get_unit_data", cmdGetUnitData },
+		{ "move", cmdMove },
+		{ "attack_move", cmdAttackMove },
+		{ "attack", cmdAttack },
+		{ "force_attack_ground", cmdForceAttackGround },
+		{ "stop", cmdStop },
+		{ "guard", cmdGuard },
 	};
 
 	CommandFn findCommand(const std::string& cmd)
