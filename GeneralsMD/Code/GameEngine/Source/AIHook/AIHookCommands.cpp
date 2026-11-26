@@ -355,6 +355,399 @@ namespace
 	}
 
 	//---------------------------------------------------------------------------------------------
+	// Economy orders (B4)
+	//---------------------------------------------------------------------------------------------
+	const char* legalBuildCodeText(LegalBuildCode lbc)
+	{
+		switch (lbc)
+		{
+			case LBC_RESTRICTED_TERRAIN: return "restricted terrain";
+			case LBC_NOT_FLAT_ENOUGH: return "ground not flat enough";
+			case LBC_OBJECTS_IN_THE_WAY: return "objects in the way";
+			case LBC_NO_CLEAR_PATH: return "no clear path for the builder";
+			case LBC_SHROUD: return "location is shrouded";
+			case LBC_TOO_CLOSE_TO_SUPPLIES: return "too close to supplies";
+			default: return "placement check failed";
+		}
+	}
+
+	Json cmdBuildStructure(const Json& args)
+	{
+		requireCanIssueOrders();
+		Player* me = localPlayer();
+		if (!hasArg(args, "dozer_id"))
+			throw CmdError("BAD_ARGS", "dozer_id is required");
+		Object* dozer = requireOwnObject(args["dozer_id"], "dozer");
+		std::string name = argStr(args, "template");
+		double x = argReal(args, "x"), y = argReal(args, "y");
+		double angle = argRealOr(args, "angle", 0.0);
+
+		const ThingTemplate* tt = findThing(name);
+		if (tt == nullptr || !tt->isKindOf(KINDOF_STRUCTURE))
+			throw CmdError("INVALID_TEMPLATE", strf("unknown structure '%s'", name.c_str()));
+		if (dozer->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) || findBuildButton(dozer, tt) == nullptr)
+			throw CmdError("WRONG_PRODUCER", strf("%s %u can't build %s", dozer->getTemplate()->getName().str(),
+				(unsigned)dozer->getID(), name.c_str()));
+		requireOnMap(x, y);
+
+		CanMakeType cmt = TheBuildAssistant->canMakeUnit(dozer, tt);
+		switch (cmt)
+		{
+			case CANMAKE_OK: break;
+			case CANMAKE_NO_PREREQ: throwMissingPrereq(tt, me);
+			case CANMAKE_NO_MONEY:
+				throw CmdError("NO_MONEY", strf("needs $%d, have $%u", tt->calcCostToBuild(me), me->getMoney()->countMoney()));
+			case CANMAKE_QUEUE_FULL:
+			case CANMAKE_PARKING_PLACES_FULL: throw CmdError("QUEUE_FULL", "builder is busy");
+			case CANMAKE_MAXED_OUT_FOR_PLAYER: throw CmdError("CANNOT_DO", strf("maximum number of %s reached", name.c_str()));
+			case CANMAKE_FACTORY_IS_DISABLED: throw CmdError("CANNOT_DO", "builder is disabled");
+			default: throw CmdError("CANNOT_DO", "the game refuses to build this");
+		}
+
+		Coord3D pos = groundPos(x, y);
+		LegalBuildCode lbc = TheBuildAssistant->isLocationLegalToBuild(&pos, tt, (Real)angle,
+			BuildAssistant::USE_QUICK_PATHFIND | BuildAssistant::TERRAIN_RESTRICTIONS | BuildAssistant::CLEAR_PATH |
+			BuildAssistant::NO_OBJECT_OVERLAP | BuildAssistant::SHROUD_REVEALED | BuildAssistant::IGNORE_STEALTHED |
+			BuildAssistant::FAIL_STEALTHED_WITHOUT_FEEDBACK,
+			dozer, nullptr);
+		if (lbc != LBC_OK)
+			throw CmdError("CANNOT_BUILD_HERE", strf("%s at (%.0f,%.0f): %s", name.c_str(), x, y, legalBuildCodeText(lbc)));
+
+		appendSelect(dozer->getID());
+		GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_DOZER_CONSTRUCT);
+		msg->appendIntegerArgument(tt->getTemplateID());
+		msg->appendLocationArgument(pos);
+		msg->appendRealArgument((Real)angle);
+		return orderResult(dozer->getID());
+	}
+
+	Object* requireFinishedProducer(const Json& args, const char* key)
+	{
+		if (!hasArg(args, key))
+			throw CmdError("BAD_ARGS", strf("%s is required", key));
+		Object* obj = requireOwnObject(args[key], key);
+		if (obj->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) || obj->testStatus(OBJECT_STATUS_SOLD) ||
+				obj->getProductionUpdateInterface() == nullptr)
+			throw CmdError("WRONG_PRODUCER", strf("%s %u can't produce now", obj->getTemplate()->getName().str(), (unsigned)obj->getID()));
+		return obj;
+	}
+
+	Json cmdTrainUnit(const Json& args)
+	{
+		requireCanIssueOrders();
+		Player* me = localPlayer();
+		Object* factory = requireFinishedProducer(args, "factory_id");
+		std::string name = argStr(args, "template");
+		long long count = argIntOr(args, "count", 1);
+
+		const ThingTemplate* tt = findThing(name);
+		if (tt == nullptr || tt->isKindOf(KINDOF_STRUCTURE))
+			throw CmdError("INVALID_TEMPLATE", strf("unknown unit '%s'", name.c_str()));
+		if (findBuildButton(factory, tt) == nullptr)
+			throw CmdError("WRONG_PRODUCER", strf("%s can't build %s", factory->getTemplate()->getName().str(), name.c_str()));
+		if (count < 1 || count > 9)
+			throw CmdError("BAD_ARGS", "count must be 1..9");
+
+		CanMakeType cmt = TheBuildAssistant->canMakeUnit(factory, tt);
+		switch (cmt)
+		{
+			case CANMAKE_OK: break;
+			case CANMAKE_NO_PREREQ: throwMissingPrereq(tt, me);
+			case CANMAKE_NO_MONEY:
+				throw CmdError("NO_MONEY", strf("needs $%d, have $%u", tt->calcCostToBuild(me), me->getMoney()->countMoney()));
+			case CANMAKE_QUEUE_FULL: throw CmdError("QUEUE_FULL", "production queue is full");
+			case CANMAKE_PARKING_PLACES_FULL: throw CmdError("QUEUE_FULL", "no free parking places");
+			case CANMAKE_MAXED_OUT_FOR_PLAYER: throw CmdError("CANNOT_DO", strf("maximum number of %s reached", name.c_str()));
+			case CANMAKE_FACTORY_IS_DISABLED: throw CmdError("CANNOT_DO", "factory is disabled");
+			default: throw CmdError("CANNOT_DO", "the game refuses to build this");
+		}
+
+		// queue as many as we can afford right now (the game charges when each one starts)
+		Int cost = tt->calcCostToBuild(me);
+		long long affordable = cost > 0 ? (long long)(me->getMoney()->countMoney() / (UnsignedInt)cost) : count;
+		long long n = count < affordable ? count : affordable;
+		if (n < 1)
+			n = 1;
+
+		ProductionUpdateInterface* pu = factory->getProductionUpdateInterface();
+		appendSelect(factory->getID());
+		for (long long i = 0; i < n; ++i)
+		{
+			GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_QUEUE_UNIT_CREATE);
+			msg->appendIntegerArgument(tt->getTemplateID());
+			msg->appendIntegerArgument(pu->requestUniqueUnitID());	// as ControlBarCommandProcessing does
+		}
+		Json res = orderResult(factory->getID());
+		res["count"] = n;
+		return res;
+	}
+
+	Json cmdCancelTrain(const Json& args)
+	{
+		requireCanIssueOrders();
+		Object* factory = requireFinishedProducer(args, "factory_id");
+		std::string name = argStr(args, "template");
+		const ThingTemplate* tt = findThing(name);
+		if (tt == nullptr)
+			throw CmdError("INVALID_TEMPLATE", strf("unknown unit '%s'", name.c_str()));
+
+		ProductionUpdateInterface* pu = factory->getProductionUpdateInterface();
+		const ProductionEntry* found = nullptr;
+		for (const ProductionEntry* e = pu->firstProduction(); e; e = pu->nextProduction(e))
+			if (e->getProductionType() == PRODUCTION_UNIT && e->getProductionObject() && e->getProductionObject()->isEquivalentTo(tt))
+				found = e;	// cancel the last one queued
+		if (found == nullptr)
+			throw CmdError("CANNOT_DO", strf("%s is not in the queue", name.c_str()));
+
+		appendSelect(factory->getID());
+		GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_CANCEL_UNIT_CREATE);
+		msg->appendIntegerArgument(found->getProductionID());
+		return orderResult(factory->getID());
+	}
+
+	Json cmdResearchUpgrade(const Json& args)
+	{
+		requireCanIssueOrders();
+		Player* me = localPlayer();
+		Object* building = requireFinishedProducer(args, "building_id");
+		std::string name = argStr(args, "upgrade");
+		const UpgradeTemplate* ut = findUpgradeByName(name);
+		if (ut == nullptr)
+			throw CmdError("INVALID_TEMPLATE", strf("unknown upgrade '%s'", name.c_str()));
+		const CommandButton* button = findUpgradeButton(building, ut);
+		if (button == nullptr)
+			throw CmdError("WRONG_PRODUCER", strf("%s can't research %s", building->getTemplate()->getName().str(), name.c_str()));
+
+		ProductionUpdateInterface* pu = building->getProductionUpdateInterface();
+		if (ut->getUpgradeType() == UPGRADE_TYPE_PLAYER)
+		{
+			if (me->hasUpgradeComplete(ut))
+				throw CmdError("CANNOT_DO", strf("%s is already researched", name.c_str()));
+			if (me->hasUpgradeInProduction(ut))
+				throw CmdError("CANNOT_DO", strf("%s is already in production", name.c_str()));
+		}
+		else
+		{
+			if (building->hasUpgrade(ut))
+				throw CmdError("CANNOT_DO", strf("%s already has %s", building->getTemplate()->getName().str(), name.c_str()));
+			if (!building->affectedByUpgrade(ut))
+				throw CmdError("CANNOT_DO", strf("%s does not apply to this building", name.c_str()));
+		}
+		if (pu->isUpgradeInQueue(ut))
+			throw CmdError("CANNOT_DO", strf("%s is already queued", name.c_str()));
+
+		// science-gated buttons (e.g. general-specific upgrades)
+		const ScienceVec& sv = button->getScienceVec();
+		for (size_t i = 0; i < sv.size(); ++i)
+			if (!me->hasScience(sv[i]))
+				throw CmdError("MISSING_PREREQ", "needs " + std::string(TheScienceStore->getInternalNameForScience(sv[i]).str()));
+
+		if (!TheUpgradeCenter->canAffordUpgrade(me, ut, FALSE))
+			throw CmdError("NO_MONEY", strf("needs $%d, have $%u", ut->calcCostToBuild(me), me->getMoney()->countMoney()));
+		CanMakeType cmt = pu->canQueueUpgrade(ut);
+		if (cmt == CANMAKE_QUEUE_FULL)
+			throw CmdError("QUEUE_FULL", "production queue is full");
+		if (cmt != CANMAKE_OK)
+			throw CmdError("CANNOT_DO", "the game refuses to queue this upgrade");
+
+		appendSelect(building->getID());
+		GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_QUEUE_UPGRADE);
+		msg->appendObjectIDArgument(building->getID());
+		msg->appendIntegerArgument(ut->getUpgradeNameKey());
+		return orderResult(building->getID());
+	}
+
+	Json cmdPurchaseScience(const Json& args)
+	{
+		requireCanIssueOrders();
+		Player* me = localPlayer();
+		std::string name = argStr(args, "science");
+		ScienceType st = findScienceByName(name);
+		if (st == SCIENCE_INVALID || !TheScienceStore->isValidScience(st))
+			throw CmdError("INVALID_TEMPLATE", strf("unknown science '%s'", name.c_str()));
+		if (me->hasScience(st))
+			throw CmdError("NOT_READY", strf("%s is already owned", name.c_str()));
+		if (me->isScienceDisabled(st) || me->isScienceHidden(st))
+			throw CmdError("NOT_READY", strf("%s is not available", name.c_str()));
+		Int cost = TheScienceStore->getSciencePurchaseCost(st);
+		if (cost <= 0)
+			throw CmdError("NOT_READY", strf("%s can't be purchased", name.c_str()));
+		if (!TheScienceStore->playerHasPrereqsForScience(me, st))
+			throw CmdError("NOT_READY", strf("%s: rank or prerequisite sciences missing", name.c_str()));
+		if (cost > me->getSciencePurchasePoints())
+			throw CmdError("NOT_READY", strf("%s costs %d points, have %d", name.c_str(), cost, me->getSciencePurchasePoints()));
+
+		GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_PURCHASE_SCIENCE);
+		msg->appendIntegerArgument(st);
+		Json res;
+		res["queued"] = true;
+		res["unit_ids"] = Json::array();
+		return res;
+	}
+
+	/// Options of the UI button that fires this power (targeting flags etc.), 0 if none.
+	UnsignedInt powerButtonOptions(const SpecialPowerTemplate* sp)
+	{
+		if (TheControlBar == nullptr)
+			return 0;
+		for (const CommandButton* b = TheControlBar->getCommandButtons(); b; b = const_cast<CommandButton*>(b)->friend_getNext())
+			if (b->getSpecialPowerTemplate() == sp &&
+					(b->getCommandType() == GUI_COMMAND_SPECIAL_POWER || b->getCommandType() == GUI_COMMAND_SPECIAL_POWER_FROM_SHORTCUT))
+				return b->getOptions();
+		return 0;
+	}
+
+	Bool moduleUsable(Object* obj, SpecialPowerModuleInterface* spm, Player* me)
+	{
+		if (spm == nullptr || spm->isScriptOnly())
+			return FALSE;
+		if (obj->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) || obj->testStatus(OBJECT_STATUS_SOLD) || obj->isEffectivelyDead())
+			return FALSE;
+		ScienceType req = spm->getRequiredScience();
+		if (req != SCIENCE_INVALID && !me->hasScience(req))
+			return FALSE;
+		return TRUE;
+	}
+
+	Json cmdFireSpecialPower(const Json& args)
+	{
+		requireCanIssueOrders();
+		Player* me = localPlayer();
+		std::string name = argStr(args, "power");
+		const SpecialPowerTemplate* sp = findPowerByName(name);
+		if (sp == nullptr)
+			throw CmdError("INVALID_TEMPLATE", strf("unknown special power '%s'", name.c_str()));
+
+		Object* source = nullptr;
+		SpecialPowerModuleInterface* spm = nullptr;
+		if (hasArg(args, "source_id"))
+		{
+			source = requireOwnObject(args["source_id"], "source");
+			spm = source->getSpecialPowerModule(sp);
+			if (!moduleUsable(source, spm, me))
+				throw CmdError("CANNOT_DO", strf("%s %u can't use %s", source->getTemplate()->getName().str(), (unsigned)source->getID(), name.c_str()));
+		}
+		else
+		{
+			UnsignedInt best = 0xffffffffu;
+			for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject())
+			{
+				if (obj->getControllingPlayer() != me)
+					continue;
+				SpecialPowerModuleInterface* m = obj->getSpecialPowerModule(sp);
+				if (!moduleUsable(obj, m, me))
+					continue;
+				UnsignedInt rf = obj->isDisabled() ? 0xfffffff0u : m->getReadyFrame();
+				if (source == nullptr || rf < best)
+				{
+					source = obj;
+					spm = m;
+					best = rf;
+				}
+			}
+			if (source == nullptr)
+				throw CmdError("NOT_READY", strf("%s is not unlocked", name.c_str()));
+		}
+
+		UnsignedInt now = TheGameLogic->getFrame();
+		if (source->isDisabled())
+			throw CmdError("NOT_READY", strf("%s: source is disabled", name.c_str()));
+		UnsignedInt readyFrame = spm->getReadyFrame();
+		if (readyFrame > now)
+			throw CmdError("NOT_READY", strf("%s ready in %.0f s", name.c_str(), (double)(readyFrame - now) / logicFps()));
+
+		UnsignedInt options = powerButtonOptions(sp);
+		const Bool needsObject = (options & COMMAND_OPTION_NEED_OBJECT_TARGET) != 0;
+		const Bool needsPos = (options & NEED_TARGET_POS) != 0;
+
+		if (hasArg(args, "target_id"))
+		{
+			ObjectID tid = (ObjectID)argObjectID(args["target_id"], "target_id");
+			Object* target = findAlive(tid);
+			if (target == nullptr || !isVisibleToLocal(target))
+				throw CmdError("UNIT_DEAD", strf("target %u does not exist or is not visible", (unsigned)tid));
+			if (needsPos && !needsObject)
+			{
+				// location power aimed at an object: fire at its position
+				GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_SPECIAL_POWER_AT_LOCATION);
+				msg->appendIntegerArgument(sp->getID());
+				msg->appendLocationArgument(*target->getPosition());
+				msg->appendRealArgument(INVALID_ANGLE);
+				msg->appendObjectIDArgument(tid);
+				msg->appendIntegerArgument(options);
+				msg->appendObjectIDArgument(source->getID());
+			}
+			else
+			{
+				GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_SPECIAL_POWER_AT_OBJECT);
+				msg->appendIntegerArgument(sp->getID());
+				msg->appendObjectIDArgument(tid);
+				msg->appendIntegerArgument(options);
+				msg->appendObjectIDArgument(source->getID());
+			}
+		}
+		else if (hasArg(args, "x") || hasArg(args, "y"))
+		{
+			if (needsObject)
+				throw CmdError("BAD_ARGS", strf("%s needs target_id", name.c_str()));
+			double x = argReal(args, "x"), y = argReal(args, "y");
+			requireOnMap(x, y);
+			GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_SPECIAL_POWER_AT_LOCATION);
+			msg->appendIntegerArgument(sp->getID());
+			msg->appendLocationArgument(groundPos(x, y));
+			msg->appendRealArgument(INVALID_ANGLE);
+			msg->appendObjectIDArgument(INVALID_ID);
+			msg->appendIntegerArgument(options);
+			msg->appendObjectIDArgument(source->getID());
+		}
+		else
+		{
+			if (needsObject)
+				throw CmdError("BAD_ARGS", strf("%s needs target_id", name.c_str()));
+			if (needsPos)
+				throw CmdError("BAD_ARGS", strf("%s needs x and y", name.c_str()));
+			GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_SPECIAL_POWER);
+			msg->appendIntegerArgument(sp->getID());
+			msg->appendIntegerArgument(options);
+			msg->appendObjectIDArgument(source->getID());
+		}
+		Json res = orderResult(source->getID());
+		res["source_id"] = (unsigned)source->getID();
+		return res;
+	}
+
+	Json cmdSell(const Json& args)
+	{
+		requireCanIssueOrders();
+		if (!hasArg(args, "building_id"))
+			throw CmdError("BAD_ARGS", "building_id is required");
+		Object* b = requireOwnObject(args["building_id"], "building");
+		if (!b->isKindOf(KINDOF_STRUCTURE))
+			throw CmdError("CANNOT_DO", "only structures can be sold");
+		if (b->testStatus(OBJECT_STATUS_SOLD))
+			throw CmdError("CANNOT_DO", "already being sold");
+		appendSelect(b->getID());
+		TheMessageStream->appendMessage(GameMessage::MSG_SELL);
+		return orderResult(b->getID());
+	}
+
+	Json cmdSetRallyPoint(const Json& args)
+	{
+		requireCanIssueOrders();
+		if (!hasArg(args, "building_id"))
+			throw CmdError("BAD_ARGS", "building_id is required");
+		Object* b = requireOwnObject(args["building_id"], "building");
+		double x = argReal(args, "x"), y = argReal(args, "y");
+		requireOnMap(x, y);
+		if (b->getObjectExitInterface() == nullptr)
+			throw CmdError("CANNOT_DO", strf("%s has no rally point", b->getTemplate()->getName().str()));
+		GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_SET_RALLY_POINT);
+		msg->appendObjectIDArgument(b->getID());
+		msg->appendLocationArgument(groundPos(x, y));
+		return orderResult(b->getID());
+	}
+
+	//---------------------------------------------------------------------------------------------
 	typedef Json (*CommandFn)(const Json&);
 	struct CommandEntry
 	{
@@ -376,6 +769,14 @@ namespace
 		{ "force_attack_ground", cmdForceAttackGround },
 		{ "stop", cmdStop },
 		{ "guard", cmdGuard },
+		{ "build_structure", cmdBuildStructure },
+		{ "train_unit", cmdTrainUnit },
+		{ "cancel_train", cmdCancelTrain },
+		{ "research_upgrade", cmdResearchUpgrade },
+		{ "purchase_science", cmdPurchaseScience },
+		{ "fire_special_power", cmdFireSpecialPower },
+		{ "sell", cmdSell },
+		{ "set_rally_point", cmdSetRallyPoint },
 	};
 
 	CommandFn findCommand(const std::string& cmd)
