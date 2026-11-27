@@ -153,6 +153,11 @@ void W3DWaypointBuffer::drawWaypoints(RenderInfoClass &rinfo)
   if ( ! TheInGameUI )
     return;
 
+	// zh-mcp: the "SCMNode" model can be missing when the buffer is built; retry, and never draw with null
+	if ( m_waypointNodeRobj == nullptr )
+		m_waypointNodeRobj = WW3DAssetManager::Get_Instance()->Create_Render_Obj( "SCMNode" );
+	if ( m_waypointNodeRobj == nullptr || m_line == nullptr )
+		return;
 
   setDefaultLineStyle();
 
