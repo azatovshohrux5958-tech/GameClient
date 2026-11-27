@@ -274,8 +274,9 @@ namespace
 
 	[[noreturn]] void throwMissingPrereq(const ThingTemplate* tt, Player* me)
 	{
-		std::vector<std::string> miss = missingPrereqNames(tt, me);
-		throw CmdError("MISSING_PREREQ", miss.empty() ? std::string("prerequisites not met") : "needs " + joinNames(miss));
+		std::string text;
+		std::vector<std::string> miss = missingPrereqNames(tt, me, &text);
+		throw CmdError("MISSING_PREREQ", text.empty() ? std::string("prerequisites not met") : "needs " + text, miss);
 	}
 
 	//---------------------------------------------------------------------------------------------
@@ -563,9 +564,12 @@ namespace
 
 		// science-gated buttons (e.g. general-specific upgrades)
 		const ScienceVec& sv = button->getScienceVec();
+		std::vector<std::string> missSci;
 		for (size_t i = 0; i < sv.size(); ++i)
 			if (!me->hasScience(sv[i]))
-				throw CmdError("MISSING_PREREQ", "needs " + std::string(TheScienceStore->getInternalNameForScience(sv[i]).str()));
+				missSci.push_back(TheScienceStore->getInternalNameForScience(sv[i]).str());
+		if (!missSci.empty())
+			throw CmdError("MISSING_PREREQ", "needs " + joinNames(missSci), missSci);
 
 		if (!TheUpgradeCenter->canAffordUpgrade(me, ut, FALSE))
 			throw CmdError("NO_MONEY", strf("needs $%d, have $%u", ut->calcCostToBuild(me), me->getMoney()->countMoney()));

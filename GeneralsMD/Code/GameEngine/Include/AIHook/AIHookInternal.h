@@ -62,7 +62,11 @@ namespace AIHook
 	{
 		std::string code;
 		std::string message;
-		CmdError(const char* c, const std::string& m) : code(c), message(m) {}
+		std::vector<std::string> missing;	///< MISSING_PREREQ only: machine-readable names (error.missing)
+		bool hasMissing;
+		CmdError(const char* c, const std::string& m) : code(c), message(m), hasMissing(false) {}
+		CmdError(const char* c, const std::string& m, const std::vector<std::string>& miss)
+			: code(c), message(m), missing(miss), hasMissing(true) {}
 	};
 
 	std::string strf(const char* format, ...);
@@ -118,8 +122,13 @@ namespace AIHook
 	void stateOnMatchEnd();
 
 	Json playerJson();					///< the "player" block of get_state
+	int supplyRemaining(const Object* obj);	///< cash left in a supply source (warehouse dock), -1 if it isn't one
+	bool isSupplyCenter(const Object* obj);	///< has a SupplyCenterDockUpdate (where harvesters return boxes)
 	std::vector<std::string> unitPrereqNames(const ThingTemplate* tt);
-	std::vector<std::string> missingPrereqNames(const ThingTemplate* tt, Player* player);
+	std::vector<std::string> sciencePrereqNames(const ThingTemplate* tt);	///< SCIENCE_ names in the template's prerequisites
+	/// Unmet prerequisites of 'tt' for 'player': building names ("A|B" for alternatives) and SCIENCE_ names.
+	/// 'text' (optional) receives the same list for a message, with science display names when known.
+	std::vector<std::string> missingPrereqNames(const ThingTemplate* tt, Player* player, std::string* text = nullptr);
 
 	//---------------------------------------------------------------------------------------------
 	// Events (AIHookEvents.cpp)

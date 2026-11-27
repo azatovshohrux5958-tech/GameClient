@@ -100,7 +100,8 @@ namespace
 		serverSend(s_clientGen, j.dump(-1, ' ', false, Json::error_handler_t::replace));
 	}
 
-	void sendError(const Json& id, const std::string& code, const std::string& message)
+	void sendError(const Json& id, const std::string& code, const std::string& message,
+		const std::vector<std::string>* missing = nullptr)
 	{
 		Json resp;
 		resp["id"] = id;
@@ -109,6 +110,8 @@ namespace
 		Json err;
 		err["code"] = code;
 		err["message"] = message;
+		if (missing)
+			err["missing"] = *missing;
 		resp["error"] = err;
 		sendJson(resp);
 	}
@@ -192,7 +195,7 @@ namespace
 		}
 		catch (const CmdError& e)
 		{
-			sendError(id, e.code, e.message);
+			sendError(id, e.code, e.message, e.hasMissing ? &e.missing : nullptr);
 		}
 		catch (const std::exception& e)
 		{

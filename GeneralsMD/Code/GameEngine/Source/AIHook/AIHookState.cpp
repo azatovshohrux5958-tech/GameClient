@@ -459,6 +459,7 @@ namespace
 		d["armor"] = templateArmorName(tt);
 		d["armor_coefficients"] = templateArmorCoefficients(tt);
 		d["prereqs"] = unitPrereqNames(tt);
+		d["science_prereqs"] = sciencePrereqNames(tt);
 		std::map<std::string, std::vector<std::string> >::const_iterator it = s_builtBy.find(tt->getName().str());
 		d["built_by"] = it != s_builtBy.end() ? it->second : std::vector<std::string>();
 		Json kinds = Json::array();
@@ -603,34 +604,102 @@ std::vector<std::string> unitPrereqNames(const ThingTemplate* tt)
 	return out;
 }
 
-std::vector<std::string> missingPrereqNames(const ThingTemplate* tt, Player* player)
+std::vector<std::string> sciencePrereqNames(const ThingTemplate* tt)
 {
 	std::vector<std::string> out;
+	for (Int i = 0; i < tt->getPrereqCount(); ++i)
+	{
+		const ScienceVec& sv = tt->getNthPrereq(i)->friend_getPrereqSciences();
+		for (size_t k = 0; k < sv.size(); ++k)
+		{
+			std::string n = TheScienceStore->getInternalNameForScience(sv[k]).str();
+			if (!n.empty() && std::find(out.begin(), out.end(), n) == out.end())
+				out.push_back(n);
+		}
+	}
+	return out;
+}
+
+std::vector<std::string> missingPrereqNames(const ThingTemplate* tt, Player* player, std::string* text)
+{
+	std::vector<std::string> out;
+	std::vector<std::string> shown;	// same entries for the message, with science display names
 	for (Int i = 0; i < tt->getPrereqCount(); ++i)
 	{
 		const ProductionPrerequisite* pre = tt->getNthPrereq(i);
 		if (pre->isSatisfied(player))
 			continue;
+		size_t before = out.size();
+
+		// object prerequisites: the first alternative block (as unitPrereqNames lists it)
 		const ThingTemplate* alts[16];
 		Int n = pre->getAllPossibleBuildFacilityTemplates(alts, 16);
 		std::string s;
+		Int validAlts = 0;
+		const ThingTemplate* valid[16];
 		for (Int k = 0; k < n; ++k)
 		{
 			if (alts[k] == nullptr)
 				continue;
+			valid[validAlts++] = alts[k];
 			if (!s.empty())
 				s += "|";
 			s += alts[k]->getName().str();
 		}
-		if (s.empty())
+		if (validAlts > 0)
 		{
-			// science prerequisite: only the localized text is available
+			Int counts[16];
+			player->countObjectsByThingTemplate(validAlts, valid, false, counts);	// what isSatisfied counts
+			Int owned = 0;
+			for (Int k = 0; k < validAlts; ++k)
+				owned += counts[k];
+			if (owned == 0)
+			{
+				out.push_back(s);
+				shown.push_back(s);
+			}
+		}
+
+		// science prerequisites
+		const ScienceVec& sv = pre->friend_getPrereqSciences();
+		for (size_t k = 0; k < sv.size(); ++k)
+		{
+			if (player->hasScience(sv[k]))
+				continue;
+			std::string name = TheScienceStore->getInternalNameForScience(sv[k]).str();
+			if (name.empty() || std::find(out.begin(), out.end(), name) != out.end())
+				continue;
+			out.push_back(name);
+			UnicodeString disp, desc;
+			std::string label = name;
+			if (TheScienceStore->getNameAndDescription(sv[k], disp, desc) && !disp.isEmpty())
+			{
+				AsciiString a;
+				a.translate(disp);
+				if (!a.isEmpty())
+					label += std::string(" (") + a.str() + ")";
+			}
+			shown.push_back(label);
+		}
+
+		if (out.size() == before)
+		{
+			// unmet for a reason we can't name (e.g. a second object block): the game's own text, message only
 			AsciiString a;
 			a.translate(pre->getRequiresList(player));
-			s = a.str();
+			if (!a.isEmpty())
+				shown.push_back(a.str());
 		}
-		if (!s.empty())
-			out.push_back(s);
+	}
+	if (text)
+	{
+		text->clear();
+		for (size_t i = 0; i < shown.size(); ++i)
+		{
+			if (i)
+				*text += ", ";
+			*text += shown[i];
+		}
 	}
 	return out;
 }

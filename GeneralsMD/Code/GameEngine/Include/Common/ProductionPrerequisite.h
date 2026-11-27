@@ -95,6 +95,7 @@ public:
 	const ThingTemplate *getExistingBuildFacilityTemplate( const Player *player ) const;
 
 	Int getAllPossibleBuildFacilityTemplates(const ThingTemplate* tmpls[], Int maxtmpls) const;
+	const ScienceVec& friend_getPrereqSciences() const { return m_prereqSciences; }	// zh-mcp AIHook (read-only)
 
 private:
 
