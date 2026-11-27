@@ -68,6 +68,9 @@
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
+#include "GameLogic/Module/SupplyCenterDockUpdate.h"
+#include "GameLogic/Module/SupplyWarehouseDockUpdate.h"
+#include "Common/GlobalData.h"
 
 namespace AIHook
 {
@@ -289,6 +292,9 @@ namespace
 		d["y"] = r1(obj->getPosition()->y);
 		healthOf(obj, d);
 		d["veterancy"] = (int)obj->getVeterancyLevel();
+		int supply = supplyRemaining(obj);
+		if (supply >= 0)
+			d["supply"] = supply;
 		return d;
 	}
 
@@ -577,6 +583,25 @@ namespace
 		}
 		return 0.0;
 	}
+}
+
+//-------------------------------------------------------------------------------------------------
+// Supply sources (shared with the commands)
+//-------------------------------------------------------------------------------------------------
+int supplyRemaining(const Object* obj)
+{
+	// same lookup and value as the UI's warehouse tooltip (InGameUI.cpp, "TOOLTIP:SupplyWarehouse")
+	static const NameKeyType key_warehouseUpdate = NAMEKEY("SupplyWarehouseDockUpdate");
+	const SupplyWarehouseDockUpdate* w = (const SupplyWarehouseDockUpdate*)obj->findUpdateModule(key_warehouseUpdate);
+	if (w == nullptr)
+		return -1;
+	return w->getBoxesStored() * TheGlobalData->m_baseValuePerSupplyBox;
+}
+
+bool isSupplyCenter(const Object* obj)
+{
+	static const NameKeyType key_centerUpdate = NAMEKEY("SupplyCenterDockUpdate");
+	return obj->findUpdateModule(key_centerUpdate) != nullptr;
 }
 
 //-------------------------------------------------------------------------------------------------

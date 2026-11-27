@@ -34,6 +34,7 @@
 
 #include "AIHook/AIHookInternal.h"
 
+#include "Common/ActionManager.h"
 #include "Common/BuildAssistant.h"
 #include "Common/GameType.h"
 #include "Common/KindOf.h"
@@ -51,11 +52,14 @@
 #include "GameClient/Drawable.h"
 #include "GameClient/InGameUI.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/PartitionManager.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Module/BehaviorModule.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
+#include "GameLogic/Module/AIUpdate.h"
+#include "GameLogic/Module/SupplyTruckAIUpdate.h"
 
 namespace AIHook
 {
@@ -355,6 +359,156 @@ namespace
 		GameMessage* msg = TheMessageStream->appendMessage(type);
 		msg->appendObjectIDArgument(tid);
 		return orderResult(units);
+	}
+
+	//---------------------------------------------------------------------------------------------
+	// Harvesting (protocol P6, additive)
+	//---------------------------------------------------------------------------------------------
+	const SupplyTruckAIInterface* harvesterOf(const Object* obj)
+	{
+		const AIUpdateInterface* ai = obj->getAI();
+		return ai ? ai->getSupplyTruckAIInterface() : nullptr;
+	}
+
+	/// Why 'unit' can't dock at 'dock' (for messages); mirrors ActionManager::canTransferSuppliesAt.
+	std::string whyCannotGather(const Object* unit, const Object* dock)
+	{
+		const SupplyTruckAIInterface* h = harvesterOf(unit);
+		std::string u = strf("%s %u", unit->getTemplate()->getName().str(), (unsigned)unit->getID());
+		if (h == nullptr)
+			return u + " is not a harvester";
+		if (!h->isAvailableForSupplying())
+			return u + " is not available for supplying (e.g. carrying passengers)";
+		if (dock->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) || dock->testStatus(OBJECT_STATUS_SOLD))
+			return strf("target %u is under construction or being sold", (unsigned)dock->getID());
+		if (supplyRemaining(dock) == 0)
+			return strf("supply source %u is empty", (unsigned)dock->getID());
+		if (supplyRemaining(dock) > 0 && dock->getRelationship(unit) == ENEMIES)
+			return strf("supply source %u belongs to an enemy", (unsigned)dock->getID());
+		if (isSupplyCenter(dock))
+		{
+			if (dock->getControllingPlayer() != unit->getControllingPlayer())
+				return strf("supply center %u is not yours", (unsigned)dock->getID());
+			if (h->getNumberBoxes() == 0)
+				return u + " carries no supplies to return";
+		}
+		return u + " can't dock there";
+	}
+
+	/// A non-own target the player may use: visible now, or a supply source seen before and now in
+	/// fog (the UI lets players right-click fogged supply; ActionManager::canTransferSuppliesAt).
+	bool gatherTargetKnown(const Object* t)
+	{
+		Player* me = localPlayer();
+		if (t->getControllingPlayer() == me || isVisibleToLocal(t))
+			return true;
+		if (supplyRemaining(t) < 0 || t->isContained())
+			return false;
+		return ThePartitionManager->getShroudStatusForPlayer(me->getPlayerIndex(), t->getPosition()) == CELLSHROUD_FOGGED;
+	}
+
+	Json cmdGather(const Json& args)
+	{
+		requireCanIssueOrders();
+		Player* me = localPlayer();
+		UnitList units = collectUnits(args);
+
+		// only harvesters
+		std::vector<Object*> harvesters;
+		std::vector<ObjectID> keep;
+		for (size_t i = 0; i < units.ok.size(); ++i)
+		{
+			Object* o = findAlive(units.ok[i]);
+			const SupplyTruckAIInterface* h = o ? harvesterOf(o) : nullptr;
+			if (h == nullptr)
+			{
+				Json r;
+				r["id"] = (unsigned)units.ok[i];
+				r["code"] = "CANNOT_DO";
+				units.rejected.push_back(r);
+			}
+			else
+			{
+				harvesters.push_back(o);
+				keep.push_back(units.ok[i]);
+			}
+		}
+		if (harvesters.empty())
+			throw CmdError("CANNOT_DO", strf("no harvesters in %s", idText(args["unit_ids"]).c_str()));
+
+		Object* target = nullptr;
+		if (hasArg(args, "target_id"))
+		{
+			ObjectID tid = (ObjectID)argObjectID(args["target_id"], "target_id");
+			target = findAlive(tid);
+			if (target == nullptr || !gatherTargetKnown(target))
+				throw CmdError("UNIT_DEAD", strf("target %u does not exist or is not visible", (unsigned)tid));
+			if (supplyRemaining(target) < 0 && !isSupplyCenter(target))
+				throw CmdError("CANNOT_DO", strf("%s %u is not a supply source or supply center",
+					target->getTemplate()->getName().str(), (unsigned)tid));
+		}
+		else
+		{
+			// nearest visible supply source with supplies left, from the harvesters' centroid
+			Real cx = 0, cy = 0;
+			for (size_t i = 0; i < harvesters.size(); ++i)
+			{
+				cx += harvesters[i]->getPosition()->x;
+				cy += harvesters[i]->getPosition()->y;
+			}
+			cx /= (Real)harvesters.size();
+			cy /= (Real)harvesters.size();
+			Real best = 0;
+			for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject())
+			{
+				if (obj->isEffectivelyDead() || obj->isDestroyed() || supplyRemaining(obj) <= 0)
+					continue;
+				if (obj->getControllingPlayer() != me && !isVisibleToLocal(obj))
+					continue;
+				bool anyCan = false;
+				for (size_t i = 0; i < harvesters.size() && !anyCan; ++i)
+					anyCan = TheActionManager->canDockAt(harvesters[i], obj, CMD_FROM_PLAYER) == TRUE;
+				if (!anyCan)
+					continue;
+				Real dx = obj->getPosition()->x - cx, dy = obj->getPosition()->y - cy;
+				Real d2 = dx * dx + dy * dy;
+				if (target == nullptr || d2 < best)
+				{
+					target = obj;
+					best = d2;
+				}
+			}
+			if (target == nullptr)
+				throw CmdError("CANNOT_DO", "no visible supply source with supplies left");
+		}
+
+		// the same legality test the UI runs before it sends MSG_DOCK (InGameUI ACTIONTYPE_DOCK_AT)
+		std::vector<ObjectID> ok;
+		std::string firstWhy;
+		for (size_t i = 0; i < harvesters.size(); ++i)
+		{
+			if (TheActionManager->canDockAt(harvesters[i], target, CMD_FROM_PLAYER))
+				ok.push_back(keep[i]);
+			else
+			{
+				if (firstWhy.empty())
+					firstWhy = whyCannotGather(harvesters[i], target);
+				Json r;
+				r["id"] = (unsigned)keep[i];
+				r["code"] = "CANNOT_DO";
+				units.rejected.push_back(r);
+			}
+		}
+		if (ok.empty())
+			throw CmdError("CANNOT_DO", firstWhy);
+
+		units.ok = ok;
+		appendSelect(units.ok);
+		GameMessage* msg = TheMessageStream->appendMessage(GameMessage::MSG_DOCK);
+		msg->appendObjectIDArgument(target->getID());
+		Json res = orderResult(units);
+		res["target_id"] = (unsigned)target->getID();
+		return res;
 	}
 
 	//---------------------------------------------------------------------------------------------
@@ -806,6 +960,7 @@ namespace
 		{ "fire_special_power", cmdFireSpecialPower },
 		{ "sell", cmdSell },
 		{ "set_rally_point", cmdSetRallyPoint },
+		{ "gather", cmdGather },
 	};
 
 	CommandFn findCommand(const std::string& cmd)
