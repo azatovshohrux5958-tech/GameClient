@@ -53,6 +53,7 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/TerrainLogic.h"
+#include "GameLogic/Module/BehaviorModule.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
 
@@ -133,13 +134,14 @@ namespace
 			const Json& v = ids[i];
 			const char* code = nullptr;
 			ObjectID id = INVALID_ID;
-			if (!v.is_number_integer() || v.get<long long>() <= 0)
+			if (!v.is_number_integer() || v.get<long long>() <= 0 || v.get<long long>() > 0x7fffffffLL)
 				code = "BAD_ARGS";
 			else
 			{
 				id = (ObjectID)v.get<long long>();
 				Object* obj = findAlive(id);
-				if (obj == nullptr)
+				// fog: a non-own object the player can't see answers exactly like a missing one
+				if (obj == nullptr || (obj->getControllingPlayer() != me && !isVisibleToLocal(obj)))
 					code = "UNIT_DEAD";
 				else if (obj->getControllingPlayer() != me)
 					code = "NOT_OWNED";
@@ -421,6 +423,19 @@ namespace
 		return orderResult(dozer->getID());
 	}
 
+	/// ProductionUpdate's MaxQueueEntries for this producer (9 if it can't be read).
+	Int queueCapacity(const Object* producer)
+	{
+		const ModuleInfo& mi = producer->getTemplate()->getBehaviorModuleInfo();
+		for (size_t i = 0; i < (size_t)mi.getCount(); ++i)
+		{
+			const ProductionUpdateModuleData* d = dynamic_cast<const ProductionUpdateModuleData*>(mi.getNthData(i));
+			if (d)
+				return d->m_maxQueueEntries;
+		}
+		return 9;
+	}
+
 	Object* requireFinishedProducer(const Json& args, const char* key)
 	{
 		if (!hasArg(args, key))
@@ -462,14 +477,24 @@ namespace
 			default: throw CmdError("CANNOT_DO", "the game refuses to build this");
 		}
 
+		ProductionUpdateInterface* pu = factory->getProductionUpdateInterface();
+
+		// every message must fit in the queue: the logic drops (and debug builds assert on) overflow
+		long long freeSlots = (long long)queueCapacity(factory) - (long long)pu->getProductionCount();
+		if (count > freeSlots)
+			throw CmdError("QUEUE_FULL", strf("queue has %lld free slot(s), asked for %lld", freeSlots < 0 ? 0LL : freeSlots, count));
+
 		// queue as many as we can afford right now (the game charges when each one starts)
 		Int cost = tt->calcCostToBuild(me);
 		long long affordable = cost > 0 ? (long long)(me->getMoney()->countMoney() / (UnsignedInt)cost) : count;
 		long long n = count < affordable ? count : affordable;
 		if (n < 1)
 			n = 1;
+		// parking-place producers (airfields) only reserve a door for one queued unit per check
+		for (BehaviorModule** m = factory->getBehaviorModules(); m && *m; ++m)
+			if ((*m)->getParkingPlaceBehaviorInterface() != nullptr)
+				n = 1;
 
-		ProductionUpdateInterface* pu = factory->getProductionUpdateInterface();
 		appendSelect(factory->getID());
 		for (long long i = 0; i < n; ++i)
 		{
@@ -841,7 +866,7 @@ Object* requireOwnObject(const Json& idValue, const char* what)
 {
 	ObjectID id = (ObjectID)argObjectID(idValue, what);
 	Object* obj = findAlive(id);
-	if (obj == nullptr)
+	if (obj == nullptr || (obj->getControllingPlayer() != localPlayer() && !isVisibleToLocal(obj)))
 		throw CmdError("UNIT_DEAD", strf("object %u does not exist", (unsigned)id));
 	if (obj->getControllingPlayer() != localPlayer())
 		throw CmdError("NOT_OWNED", strf("object %u is not yours", (unsigned)id));

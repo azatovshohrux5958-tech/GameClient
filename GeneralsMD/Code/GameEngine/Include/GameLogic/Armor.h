@@ -119,6 +119,15 @@ public:
 
 	static void parseArmorDefinition(INI* ini);
 
+	/// zh-mcp AIHook: read-only reverse lookup (name key of a stored template, NAMEKEY_INVALID if none)
+	NameKeyType friend_findKeyOf(const ArmorTemplate* tmpl) const
+	{
+		for (ArmorTemplateMap::const_iterator it = m_armorTemplates.begin(); it != m_armorTemplates.end(); ++it)
+			if (&(*it).second == tmpl)
+				return (*it).first;
+		return NAMEKEY_INVALID;
+	}
+
 private:
 
 	typedef std::hash_map< NameKeyType, ArmorTemplate, rts::hash<NameKeyType>, rts::equal_to<NameKeyType>/**/> ArmorTemplateMap;

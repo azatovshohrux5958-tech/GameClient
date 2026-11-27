@@ -435,6 +435,16 @@ namespace
 		return out;
 	}
 
+	std::string templateArmorName(const ThingTemplate* tt)
+	{
+		const ArmorTemplateSet* as = tt->findArmorTemplateSet(ArmorSetFlags());
+		const ArmorTemplate* at = as ? as->getArmorTemplate() : nullptr;
+		if (at == nullptr || TheArmorStore == nullptr)
+			return std::string();
+		NameKeyType key = TheArmorStore->friend_findKeyOf(at);
+		return key == NAMEKEY_INVALID ? std::string() : std::string(TheNameKeyGenerator->keyToName(key).str());
+	}
+
 	Json templateInfo(const ThingTemplate* tt, Player* me)
 	{
 		Json d;
@@ -446,7 +456,7 @@ namespace
 		d["speed"] = templateSpeed(tt);
 		d["vision"] = r1(tt->friend_calcVisionRange());
 		d["weapons"] = templateWeapons(tt);
-		d["armor"] = "";
+		d["armor"] = templateArmorName(tt);
 		d["armor_coefficients"] = templateArmorCoefficients(tt);
 		d["prereqs"] = unitPrereqNames(tt);
 		std::map<std::string, std::vector<std::string> >::const_iterator it = s_builtBy.find(tt->getName().str());
@@ -466,6 +476,18 @@ namespace
 		if (power != 0)
 			d["power"] = power;
 		return d;
+	}
+
+	/// Was pathfind cell (cx, cy) blocked by a map-placed structure at match start?
+	bool staticObstacleAt(int cx, int cy)
+	{
+		if (s_cells.empty())
+			return false;
+		const int i = cx - (int)floor(s_extent.lo.x / PATHFIND_CELL_SIZE_F);
+		const int j = cy - (int)floor(s_extent.lo.y / PATHFIND_CELL_SIZE_F);
+		if (i < 0 || j < 0 || i >= s_cellsW || j >= s_cellsH)
+			return true;
+		return s_cells[(size_t)j * s_cellsW + i] == '#';
 	}
 
 	//---------------------------------------------------------------------------------------------
@@ -495,7 +517,10 @@ namespace
 			if (p < 0)
 			{
 				PathfindCell* c = pf->getCell(LAYER_GROUND, idx % W, idx / W);
-				p = (c && pf->validMovementPosition(FALSE, surfaces, c)) ? 1 : 0;
+				if (c && c->getType() == PathfindCell::CELL_OBSTACLE)
+					p = staticObstacleAt(idx % W, idx / W) ? 0 : 1;	// only what the map preview shows
+				else
+					p = (c && pf->validMovementPosition(FALSE, surfaces, c)) ? 1 : 0;
 			}
 			return p == 1;
 		};
@@ -710,7 +735,7 @@ Json cmdGetState(const Json& args)
 	if (incPlayer)
 		out["player"] = playerJson();
 
-	Json own = Json::array(), enemies = Json::array(), neutral = Json::array();
+	Json own = Json::array(), enemies = Json::array(), neutral = Json::array(), allies = Json::array();
 	if (incOwn || incEnemies || incNeutral)
 	{
 		for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject())
@@ -730,8 +755,13 @@ Json cmdGetState(const Json& args)
 				if (incEnemies)
 					enemies.push_back(otherObjectJson(obj));
 			}
-			else if (incNeutral)
-				neutral.push_back(otherObjectJson(obj));
+			else if (isNeutralPlayerObject(obj))
+			{
+				if (incNeutral)
+					neutral.push_back(otherObjectJson(obj));
+			}
+			else if (incEnemies)
+				allies.push_back(otherObjectJson(obj));	// additive: allied players' objects
 		}
 	}
 	if (incOwn)
@@ -740,6 +770,8 @@ Json cmdGetState(const Json& args)
 		out["enemies"] = enemies;
 	if (incNeutral)
 		out["neutral"] = neutral;
+	if (incEnemies)
+		out["allies"] = allies;
 	return out;
 }
 
@@ -776,7 +808,67 @@ void stateOnMatchStart()
 		}
 	}
 
-	// start spots
+	// a human only knows map-placed buildings from the preview: un-block cells under structures
+	// owned by real players (the starting bases), which would reveal random start assignments
+	{
+		Player* neutralP = ThePlayerList->getNeutralPlayer();
+		for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject())
+		{
+			const Player* owner = obj->getControllingPlayer();
+			if (owner == nullptr || owner == neutralP || !obj->isKindOf(KINDOF_STRUCTURE))
+				continue;
+			const Coord3D* c = obj->getPosition();
+			const Real r = obj->getGeometryInfo().getBoundingCircleRadius() + PATHFIND_CELL_SIZE_F;
+			const int i0 = (int)((c->x - r - s_extent.lo.x) / PATHFIND_CELL_SIZE_F), i1 = (int)((c->x + r - s_extent.lo.x) / PATHFIND_CELL_SIZE_F);
+			const int j0 = (int)((c->y - r - s_extent.lo.y) / PATHFIND_CELL_SIZE_F), j1 = (int)((c->y + r - s_extent.lo.y) / PATHFIND_CELL_SIZE_F);
+			for (int j = j0 < 0 ? 0 : j0; j <= j1 && j < s_cellsH; ++j)
+				for (int i = i0 < 0 ? 0 : i0; i <= i1 && i < s_cellsW; ++i)
+				{
+					Coord3D pos;
+					pos.x = s_extent.lo.x + (i + 0.5f) * PATHFIND_CELL_SIZE_F;
+					pos.y = s_extent.lo.y + (j + 0.5f) * PATHFIND_CELL_SIZE_F;
+					pos.z = 0.0f;
+					PathfindCell* cell = pf->getCell(LAYER_GROUND, &pos);
+					if (cell && cell->getType() == PathfindCell::CELL_OBSTACLE)
+						s_cells[(size_t)j * s_cellsW + i] = '.';
+				}
+		}
+	}
+
+	// start spots: "index" is a player index (like local_player); only the local player's own spot
+	// is known, the others are reported with index null and their 0-based "slot"
+	const Coord3D* ownAnchor = nullptr;
+	{
+		Player* me = localPlayer();
+		for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject())
+		{
+			if (obj->getControllingPlayer() != me)
+				continue;
+			if (ownAnchor == nullptr || obj->isKindOf(KINDOF_COMMANDCENTER))
+				ownAnchor = obj->getPosition();
+			if (obj->isKindOf(KINDOF_COMMANDCENTER))
+				break;
+		}
+	}
+	int ownSlot = -1;
+	if (ownAnchor)
+	{
+		Real best = 1e30f;
+		for (Int n = 1; n <= MAX_PLAYER_COUNT; ++n)
+		{
+			AsciiString wpName;
+			wpName.format("Player_%d_Start", n);
+			Waypoint* wp = TheTerrainLogic->getWaypointByName(wpName);
+			if (wp == nullptr)
+				continue;
+			Real dx = wp->getLocation()->x - ownAnchor->x, dy = wp->getLocation()->y - ownAnchor->y;
+			if (dx * dx + dy * dy < best)
+			{
+				best = dx * dx + dy * dy;
+				ownSlot = n - 1;
+			}
+		}
+	}
 	for (Int n = 1; n <= MAX_PLAYER_COUNT; ++n)
 	{
 		AsciiString wpName;
@@ -785,7 +877,11 @@ void stateOnMatchStart()
 		if (wp == nullptr)
 			continue;
 		Json sp;
-		sp["index"] = n - 1;
+		if (n - 1 == ownSlot)
+			sp["index"] = (int)localPlayer()->getPlayerIndex();
+		else
+			sp["index"] = nullptr;
+		sp["slot"] = n - 1;
 		sp["x"] = r1(wp->getLocation()->x);
 		sp["y"] = r1(wp->getLocation()->y);
 		s_startPositions.push_back(sp);
@@ -904,8 +1000,11 @@ Json cmdQueryPath(const Json& args)
 		return r;
 	}
 
+	if (!s_haveStatic)
+		stateOnMatchStart();
 	Pathfinder* pf = TheAI->pathfinder();
-	Bool reachable = pf->clientSafeQuickDoesPathExist(ls, from, &to);
+	// terrain-only check (the full one sees shrouded/stealthed buildings)
+	Bool reachable = pf->clientSafeQuickDoesPathExistForUI(ls, from, &to);
 	r["reachable"] = (bool)reachable;
 	if (!reachable)
 	{

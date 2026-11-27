@@ -40,6 +40,7 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/PartitionManager.h"
+#include "GameLogic/Module/ContainModule.h"
 #include "GameLogic/Module/StealthUpdate.h"
 
 #include "gitinfo.h"
@@ -112,8 +113,39 @@ namespace
 		sendJson(resp);
 	}
 
+	/// Max [ / { nesting outside strings; copies and dumps of nlohmann values recurse, so a deeply
+	/// nested request must be rejected before it is parsed.
+	bool nestingTooDeep(const std::string& line, int limit)
+	{
+		int depth = 0;
+		bool inString = false, escaped = false;
+		for (size_t i = 0; i < line.size(); ++i)
+		{
+			const char c = line[i];
+			if (inString)
+			{
+				if (escaped) escaped = false;
+				else if (c == '\\') escaped = true;
+				else if (c == '"') inString = false;
+				continue;
+			}
+			if (c == '"') inString = true;
+			else if (c == '[' || c == '{') { if (++depth > limit) return true; }
+			else if (c == ']' || c == '}') --depth;
+		}
+		return false;
+	}
+
 	void handleLine(const std::string& line)
 	{
+		if (nestingTooDeep(line, 64))
+		{
+			Json data;
+			data["code"] = "BAD_ARGS";
+			data["message"] = "request nested too deeply";
+			emitEvent("error", data);
+			return;
+		}
 		Json msg = Json::parse(line, nullptr, false);
 		if (msg.is_discarded() || !msg.is_object() || !msg.contains("id") || !msg.contains("cmd") || !msg["cmd"].is_string())
 		{
@@ -306,12 +338,49 @@ bool isVisibleToLocal(const Object* obj)
 	return true;
 }
 
+/// The player the local player believes controls 'obj': honours undetected disguises and garrisons
+/// whose occupants are hidden from non-allies (GarrisonContain::getApparentControllingPlayer).
+const Player* apparentPlayer(const Object* obj)
+{
+	Player* me = localPlayer();
+	if (me && obj->getControllingPlayer() != me)
+	{
+		if (obj->testStatus(OBJECT_STATUS_DISGUISED) && !obj->testStatus(OBJECT_STATUS_DETECTED))
+		{
+			StealthUpdate* su = obj->getStealth();
+			if (su && su->isDisguised())
+			{
+				Player* p = ThePlayerList->getNthPlayer(su->getDisguisedPlayerIndex());
+				if (p)
+					return p;
+			}
+		}
+		const ContainModuleInterface* contain = obj->getContain();
+		if (contain)
+		{
+			const Player* p = contain->getApparentControllingPlayer(me);
+			if (p)
+				return p;
+		}
+	}
+	return obj->getControllingPlayer();
+}
+
 bool isEnemyOfLocal(const Object* obj)
 {
 	Player* me = localPlayer();
-	if (me == nullptr || obj->getTeam() == nullptr)
+	if (me == nullptr)
 		return false;
-	return me->getRelationship(obj->getTeam()) == ENEMIES;
+	const Player* p = apparentPlayer(obj);
+	if (p == obj->getControllingPlayer())
+		return obj->getTeam() != nullptr && me->getRelationship(obj->getTeam()) == ENEMIES;
+	return p != nullptr && p->getDefaultTeam() != nullptr && me->getRelationship(p->getDefaultTeam()) == ENEMIES;
+}
+
+bool isNeutralPlayerObject(const Object* obj)
+{
+	const Player* p = apparentPlayer(obj);
+	return p == nullptr || (ThePlayerList && p == ThePlayerList->getNeutralPlayer());
 }
 
 const ThingTemplate* apparentTemplate(const Object* obj)
@@ -329,15 +398,7 @@ const ThingTemplate* apparentTemplate(const Object* obj)
 
 int apparentOwner(const Object* obj)
 {
-	Player* me = localPlayer();
-	if (me && obj->getControllingPlayer() != me && obj->testStatus(OBJECT_STATUS_DISGUISED) &&
-			!obj->testStatus(OBJECT_STATUS_DETECTED))
-	{
-		StealthUpdate* su = obj->getStealth();
-		if (su && su->isDisguised())
-			return su->getDisguisedPlayerIndex();
-	}
-	const Player* p = obj->getControllingPlayer();
+	const Player* p = apparentPlayer(obj);
 	if (p == nullptr || (ThePlayerList && p == ThePlayerList->getNeutralPlayer()))
 		return -1;
 	return (int)p->getPlayerIndex();
@@ -356,7 +417,7 @@ void update()
 		if (s_enabled)
 		{
 			s_enabled = serverStart(port, std::string(GitShortSHA1));
-			DEBUG_LOG(("AIHook: %s on 127.0.0.1:%d", s_enabled ? "listening" : "FAILED to bind", port));
+			DEBUG_LOG(("AIHook: %s 127.0.0.1:%d", s_enabled ? "serving on" : "FAILED to start Winsock for", port));
 		}
 	}
 	if (!s_enabled)
@@ -364,6 +425,21 @@ void update()
 
 	const bool match = inMatch();
 	serverPublishStatus(match, protoFrame());
+
+	// a save game loaded from inside a match never shows a frame out of the match: treat a logic
+	// frame that goes backwards as end-then-start
+	{
+		static unsigned s_lastLogicFrame = 0;
+		const unsigned logicFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+		if (match && s_wasInMatch && logicFrame < s_lastLogicFrame)
+		{
+			if (s_clientConnected && !eventsGameEndSent())
+				eventsSendGameEnd("unknown");
+			stateOnMatchEnd();
+			s_wasInMatch = false;
+		}
+		s_lastLogicFrame = logicFrame;
+	}
 
 	// match start / end transitions (tracked even without a client: read-only)
 	if (match && !s_wasInMatch)
@@ -411,6 +487,7 @@ void update()
 					handleLine(in.line);
 					processedRequests = true;
 				}
+				serverLinesAnswered(in.gen, 1);
 				break;
 		}
 	}

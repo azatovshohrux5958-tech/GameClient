@@ -49,9 +49,10 @@ namespace AIHook
 		std::string line;
 	};
 
-	bool serverStart(int port, const std::string& build);	///< bind 127.0.0.1:port and start the thread
+	bool serverStart(int port, const std::string& build);	///< start the thread; it binds 127.0.0.1:port (retrying)
 	void serverPoll(std::vector<Inbound>& out);						///< take everything received since the last poll
-	void serverSend(unsigned gen, const std::string& line);	///< queue one line (newline added) for client 'gen'
+	void serverSend(unsigned gen, const std::string& line);
+	void serverLinesAnswered(unsigned gen, unsigned count);	///< main thread finished 'count' LINE items	///< queue one line (newline added) for client 'gen'
 	void serverPublishStatus(bool inGame, unsigned frame);	///< values the socket thread puts in "hello"
 
 	//---------------------------------------------------------------------------------------------
@@ -81,6 +82,8 @@ namespace AIHook
 	bool isReportable(const Object* obj);						///< filters out projectiles, trees, props, ...
 	bool isVisibleToLocal(const Object* obj);				///< fog + stealth rule of protocol §5 (non-own objects)
 	bool isEnemyOfLocal(const Object* obj);
+	bool isNeutralPlayerObject(const Object* obj);						///< apparent owner is the neutral player
+	const Player* apparentPlayer(const Object* obj);
 	const ThingTemplate* apparentTemplate(const Object* obj);	///< honours disguise for non-own objects
 	int apparentOwner(const Object* obj);								///< player index, -1 for the neutral player
 
