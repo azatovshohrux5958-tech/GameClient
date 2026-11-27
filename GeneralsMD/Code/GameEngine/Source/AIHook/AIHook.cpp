@@ -204,6 +204,46 @@ namespace
 		}
 	}
 
+	void sendGameStart();
+
+	void processInbound(bool match)
+	{
+		std::vector<Inbound> inbound;
+		serverPoll(inbound);
+		bool processedRequests = false;
+		for (size_t i = 0; i < inbound.size(); ++i)
+		{
+			const Inbound& in = inbound[i];
+			switch (in.kind)
+			{
+				case Inbound::CONNECTED:
+					s_clientConnected = true;
+					s_clientGen = in.gen;
+					if (match)
+					{
+						eventsReset();
+						s_lastEventFrame = 0xffffffffu;
+						sendGameStart();
+					}
+					break;
+				case Inbound::DISCONNECTED:
+					if (in.gen == s_clientGen)
+						s_clientConnected = false;
+					break;
+				case Inbound::LINE:
+					if (s_clientConnected && in.gen == s_clientGen)
+					{
+						handleLine(in.line);
+						processedRequests = true;
+					}
+					serverLinesAnswered(in.gen, 1);
+					break;
+			}
+		}
+		if (processedRequests)
+			commandsEndOfBatch();
+	}
+
 	void sendGameStart()
 	{
 		Player* p = localPlayer();
@@ -211,6 +251,8 @@ namespace
 		data["map"] = mapName();
 		data["local_player"] = p ? (int)p->getPlayerIndex() : -1;
 		data["side"] = p ? p->getSide().str() : "";
+		if (replayActive())
+			data["replay"] = true;	// additive: local_player is the replay POV (set_pov changes it)
 		emitEvent("game_start", data);
 	}
 }
@@ -253,6 +295,9 @@ unsigned protoFrame()
 
 Player* localPlayer()
 {
+	// during replay playback the engine's local player is the ReplayObserver: serve the chosen POV
+	if (Player* pov = replayPov())
+		return pov;
 	return ThePlayerList ? ThePlayerList->getLocalPlayer() : nullptr;
 }
 
@@ -439,6 +484,7 @@ void update()
 			if (s_clientConnected && !eventsGameEndSent())
 				eventsSendGameEnd("unknown");
 			stateOnMatchEnd();
+			replayOnMatchEnd();
 			s_wasInMatch = false;
 		}
 		s_lastLogicFrame = logicFrame;
@@ -448,6 +494,7 @@ void update()
 	if (match && !s_wasInMatch)
 	{
 		s_wasInMatch = true;
+		replayOnMatchStart();
 		stateOnMatchStart();
 		eventsReset();
 		s_lastEventFrame = 0xffffffffu;
@@ -460,42 +507,14 @@ void update()
 		if (s_clientConnected && !eventsGameEndSent())
 			eventsSendGameEnd("unknown");
 		stateOnMatchEnd();
+		replayOnMatchEnd();
 	}
 
-	std::vector<Inbound> inbound;
-	serverPoll(inbound);
-	bool processedRequests = false;
-	for (size_t i = 0; i < inbound.size(); ++i)
-	{
-		const Inbound& in = inbound[i];
-		switch (in.kind)
-		{
-			case Inbound::CONNECTED:
-				s_clientConnected = true;
-				s_clientGen = in.gen;
-				if (match)
-				{
-					eventsReset();
-					s_lastEventFrame = 0xffffffffu;
-					sendGameStart();
-				}
-				break;
-			case Inbound::DISCONNECTED:
-				if (in.gen == s_clientGen)
-					s_clientConnected = false;
-				break;
-			case Inbound::LINE:
-				if (s_clientConnected && in.gen == s_clientGen)
-				{
-					handleLine(in.line);
-					processedRequests = true;
-				}
-				serverLinesAnswered(in.gen, 1);
-				break;
-		}
-	}
-	if (processedRequests)
-		commandsEndOfBatch();
+	processInbound(match);
+
+	// replay playback: order_issued for the commands the logic executes next (protocol "replay")
+	if (match)
+		replayUpdate(s_clientConnected);
 
 	// events once per protocol frame
 	if (s_clientConnected && match)
@@ -507,6 +526,15 @@ void update()
 			eventsUpdate();
 		}
 	}
+
+	// replay_control hold_at: keep serving the client without advancing the logic
+	while (match && s_clientConnected && replayHolding())
+	{
+		Sleep(1);
+		processInbound(match);
+	}
+	if (!s_clientConnected)
+		replayReleaseHold();
 }
 
 }	// namespace AIHook

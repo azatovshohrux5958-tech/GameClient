@@ -137,4 +137,21 @@ namespace AIHook
 	void eventsUpdate();				///< once per protocol frame while a client is connected in a match
 	bool eventsGameEndSent();
 	void eventsSendGameEnd(const char* result);
+
+	//---------------------------------------------------------------------------------------------
+	// Replay playback (AIHookReplay.cpp): POV, order_issued, pacing
+	//---------------------------------------------------------------------------------------------
+	bool replayActive();					///< a replay is playing back
+	Player* replayPov();					///< the chosen point of view during a replay, else nullptr
+	void replayOnMatchStart();		///< read the replay's commands (read-only, own file handle)
+	void replayOnMatchEnd();
+	void replayUpdate(bool emit);	///< mirror selections, emit order_issued for commands of this logic frame
+	bool replayHolding();					///< replay_control hold_at reached: the hook holds the main thread
+	void replayReleaseHold();
+	const char* replayResultFor(Player* p);	///< "win" / "loss" / nullptr
+	int apparentOwnerRaw(const Object* obj);	///< controlling player index, -1 for neutral
+	Json cmdReplayInfo(const Json& args);
+	Json cmdSetPov(const Json& args);
+	Json cmdReplayControl(const Json& args);
+	Json cmdGetStateReplay(const Json& args);	///< get_state with optional "pov" (replay only)
 }

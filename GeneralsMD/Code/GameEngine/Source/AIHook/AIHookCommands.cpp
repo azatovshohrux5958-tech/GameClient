@@ -309,6 +309,8 @@ namespace
 			r["local_player"] = nullptr;
 		}
 		r["frame"] = protoFrame();
+		if (replayActive())
+			r["replay"] = true;	// additive: local_player is then the replay POV
 		return r;
 	}
 
@@ -942,7 +944,7 @@ namespace
 	{
 		{ "ping", cmdPing },
 		{ "get_status", cmdGetStatus },
-		{ "get_state", cmdGetState },
+		{ "get_state", cmdGetStateReplay },
 		{ "get_map", cmdGetMap },
 		{ "query_path", cmdQueryPath },
 		{ "get_unit_data", cmdGetUnitData },
@@ -961,6 +963,9 @@ namespace
 		{ "sell", cmdSell },
 		{ "set_rally_point", cmdSetRallyPoint },
 		{ "gather", cmdGather },
+		{ "replay_info", cmdReplayInfo },
+		{ "set_pov", cmdSetPov },
+		{ "replay_control", cmdReplayControl },
 	};
 
 	CommandFn findCommand(const std::string& cmd)

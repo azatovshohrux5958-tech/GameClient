@@ -325,7 +325,13 @@ void eventsUpdate()
 	s_sciencePoints = points;
 
 	// match result
-	if (!s_gameEndSent && TheVictoryConditions)
+	if (!s_gameEndSent && TheVictoryConditions && replayActive())
+	{
+		const char* res = replayResultFor(localPlayer());	// replay: the POV player's result
+		if (res)
+			eventsSendGameEnd(res);
+	}
+	else if (!s_gameEndSent && TheVictoryConditions)
 	{
 		if (TheVictoryConditions->isLocalAlliedVictory())
 			eventsSendGameEnd("win");
