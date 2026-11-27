@@ -464,6 +464,13 @@ Int parseReplay(char *args[], int num)
 	return 1;
 }
 
+// AIHook: let several clients run on one PC (indexed mutex, loopback IP 127.0.0.<id>, *_InstanceNN.ini).
+Int parseMultiInstance(char *args[], int)
+{
+	rts::ClientInstance::setMultiInstance(TRUE);
+	return 1;
+}
+
 Int parseJobs(char *args[], int num)
 {
 	if (num > 1)
@@ -1158,6 +1165,7 @@ static CommandLineParam paramsForStartup[] =
 	// You can pass this multiple times to play back multiple replays.
 	// You can also include wildcards. The file must be in the replay folder or in a subfolder.
 	{ "-replay", parseReplay },
+	{ "-multiinstance", parseMultiInstance }, // AIHook
 
 	// TheSuperHackers @feature helmutbuhler 23/05/2025
 	// Simulate each replay in a separate process and use 1..N processes at the same time.
